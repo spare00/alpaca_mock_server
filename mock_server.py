@@ -39,6 +39,11 @@ not implement WS.
 
 - **wall**: ``u`` from wall time modulo ``--sim-cycle-seconds`` (legacy).
 
+With **minute** clock + ``--scenario``, bar/quote timestamps and ``GET /v2/clock``
+``timestamp`` follow a synthetic US/Eastern RTH day (09:30 + simulated session
+minute) so clients with ``regular_market_only`` accept the feed off-hours.
+Override the calendar day with ``--session-date YYYY-MM-DD`` (ET).
+
 Run::
 
     python mock_server.py --scenario samples/intc_day_scenario.json
@@ -61,10 +66,13 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+_NY = ZoneInfo("America/New_York")
 
 # Paths reachable from stocktrader main.py (see module docstring).
 _MAIN_TRADING_GET_PATHS = frozenset({"/v2/clock", "/v2/account", "/v2/positions", "/v2/orders"})
@@ -97,6 +105,26 @@ def _parse_iso(s: str | None) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _default_et_session_date() -> date:
+    """Most recent weekday (Mon–Fri) in America/New_York for synthetic RTH."""
+    now_et = datetime.now(_NY)
+    d = now_et.date()
+    wd = d.weekday()
+    if wd >= 5:
+        d = d - timedelta(days=wd - 4)
+    return d
+
+
+def _et_open_datetime(d: date) -> datetime:
+    return datetime.combine(d, time(9, 30), tzinfo=_NY)
+
+
+def _utc_from_session_fminute(et_day: date, session_minute: float, session_len: float) -> datetime:
+    """Map synthetic session minute (may be negative; wraps) to UTC instant."""
+    m = float(session_minute) % float(session_len)
+    return (_et_open_datetime(et_day) + timedelta(minutes=m)).astimezone(timezone.utc)
+
+
 def _timeframe_seconds(timeframe: str) -> int | None:
     m = re.match(r"^(\d+)(Min|Hour|Day|Week|Month)$", timeframe or "")
     if not m:
@@ -118,6 +146,7 @@ class MockState:
         sim_clock_mode: str = "wall",
         session_minutes_total: int = 390,
         minutes_per_bars_tick: float = 1.0,
+        synthetic_rth_et_date: date | None = None,
     ) -> None:
         self.starting_cash = starting_cash
         self.market_open = market_open
@@ -131,6 +160,7 @@ class MockState:
         self.minutes_per_bars_tick = max(0.01, float(minutes_per_bars_tick))
         self.sim_session_minutes: float = 0.0
         self.sim_lock = threading.Lock()
+        self.synthetic_rth_et_date = synthetic_rth_et_date
 
     def virtual_u(self, at: datetime) -> float:
         t = _as_utc_timestamp(at)
@@ -301,9 +331,16 @@ def _synthetic_bars_minute_clock(
                 vol = 800.0 + 40.0 * abs(c - o) * 1000.0
                 if abs(c - o) > 0.03:
                     vol += 5000.0
+                if state.synthetic_rth_et_date is not None:
+                    t_bar = _utc_from_session_fminute(
+                        state.synthetic_rth_et_date, float(bm), session_len
+                    )
+                    t_iso = _iso(t_bar)
+                else:
+                    t_iso = _iso(t_open)
                 out[sym].append(
                     {
-                        "t": _iso(t_open),
+                        "t": t_iso,
                         "o": o,
                         "h": hi,
                         "l": lo,
@@ -399,7 +436,14 @@ class TradingHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v2/clock":
-            now = _utc_now()
+            if self.state.synthetic_rth_et_date is not None:
+                now = _utc_from_session_fminute(
+                    self.state.synthetic_rth_et_date,
+                    self.state.sim_session_minutes,
+                    float(self.state.session_minutes_total),
+                )
+            else:
+                now = _utc_now()
             self._send(
                 200,
                 {
@@ -540,6 +584,32 @@ class DataHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if path == "/v1/mock/status":
+            st = self.state
+            syn: str | None = None
+            if st.synthetic_rth_et_date is not None:
+                syn = _iso(
+                    _utc_from_session_fminute(
+                        st.synthetic_rth_et_date,
+                        st.sim_session_minutes,
+                        float(st.session_minutes_total),
+                    )
+                )
+            self._send(
+                200,
+                {
+                    "sim_session_minutes": st.sim_session_minutes,
+                    "sim_clock_mode": st.sim_clock_mode,
+                    "session_minutes_total": st.session_minutes_total,
+                    "synthetic_rth_et_date": str(st.synthetic_rth_et_date)
+                    if st.synthetic_rth_et_date
+                    else None,
+                    "synthetic_timestamp_utc": syn,
+                    "market_open_flag": st.market_open,
+                },
+            )
+            return
+
         if path not in _MAIN_DATA_PATHS:
             self._send(
                 404,
@@ -567,7 +637,14 @@ class DataHandler(BaseHTTPRequestHandler):
         if path == "/v2/stocks/quotes/latest":
             symbols = (qs.get("symbols") or [""])[0].split(",")
             symbols = [s.strip().upper() for s in symbols if s.strip()]
-            now_dt = _utc_now()
+            if self.state.synthetic_rth_et_date is not None:
+                now_dt = _utc_from_session_fminute(
+                    self.state.synthetic_rth_et_date,
+                    self.state.sim_session_minutes,
+                    float(self.state.session_minutes_total),
+                )
+            else:
+                now_dt = _utc_now()
             now = _iso(now_dt)
             quotes: dict[str, dict[str, Any]] = {}
             for sym in symbols:
@@ -633,6 +710,13 @@ def main() -> None:
         default=1.0,
         help="Simulated session minutes to advance after each GET /v2/stocks/bars (minute clock only)",
     )
+    p.add_argument(
+        "--session-date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="America/New_York calendar date for synthetic RTH timestamps (minute clock + --scenario only; default: last weekday ET)",
+    )
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
@@ -648,6 +732,16 @@ def main() -> None:
     else:
         sim_clock_mode = args.sim_clock
 
+    syn_et_date: date | None = None
+    if scenario_points and sim_clock_mode == "minute":
+        if args.session_date:
+            try:
+                syn_et_date = date.fromisoformat(args.session_date.strip())
+            except ValueError:
+                p.error("--session-date must be YYYY-MM-DD")
+        else:
+            syn_et_date = _default_et_session_date()
+
     state = MockState(
         args.cash,
         market_open=not args.market_closed,
@@ -657,6 +751,7 @@ def main() -> None:
         sim_clock_mode=sim_clock_mode,
         session_minutes_total=session_minutes_total,
         minutes_per_bars_tick=args.minutes_per_bars_tick,
+        synthetic_rth_et_date=syn_et_date,
     )
     for item in args.price:
         if "=" not in item:
@@ -678,6 +773,7 @@ def main() -> None:
             f"  Intraday scenario: {args.scenario} | symbols={','.join(sorted(scenario_points))} | "
             f"clock={sim_clock_mode}"
             + (f" | session_minutes={session_minutes_total}" if sim_clock_mode == "minute" else f" | cycle={cycle:.0f}s")
+            + (f" | synthetic RTH ET date={syn_et_date}" if syn_et_date else "")
             + "\n"
         )
     print(
@@ -687,6 +783,7 @@ def main() -> None:
         f"           POST /v2/orders   DELETE /v2/orders/{{id}}\n"
         f"  Data:    http://{args.host}:{args.data_port}\n"
         f"           GET /v2/stocks/quotes/latest   GET /v2/stocks/bars (rest mode only)\n"
+        f"           GET /v1/mock/status (simulation snapshot; not Alpaca)\n"
         f"{sim_line}"
         f"Set ALPACA_TRADING_BASE_URL and ALPACA_DATA_BASE_URL (EXECUTION_MODE / ALPACA_MARKET_DATA_MODE as needed).",
         flush=True,
