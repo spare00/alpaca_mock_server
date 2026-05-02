@@ -6,7 +6,7 @@ Local HTTP mock of the Alpaca REST endpoints used by **stocktrader** (`stocktrad
 
 ```bash
 python mock_server.py --scenario samples/intc_day_scenario.json
-python mock_server.py --scenario samples/rig_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
+python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
 ```
 
 ## Point stocktrader at the mock

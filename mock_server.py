@@ -42,7 +42,7 @@ not implement WS.
 Run::
 
     python mock_server.py --scenario samples/intc_day_scenario.json
-    python mock_server.py --scenario samples/rig_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
+    python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
 
 Point stocktrader at the mock (see ``config.py`` / ``alpaca_client.py``)::
 
@@ -607,7 +607,7 @@ def main() -> None:
         "--scenario",
         type=str,
         default=None,
-        help="JSON file with intraday curves (see samples/rig_day_scenario.json)",
+        help="JSON file with intraday curves (see samples/intc_day_scenario.json)",
     )
     p.add_argument(
         "--sim-cycle-seconds",
