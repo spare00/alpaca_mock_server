@@ -9,6 +9,8 @@ python mock_server.py --scenario samples/intc_day_scenario.json
 python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
 ```
 
+Add **`--access-log`** to print each HTTP reply (trading vs data port, status, and a short summary: clock fields, last bar OHLC, quote mids, order status, etc.). Use **`-v`** separately for stdlib-style request lines.
+
 ## Point stocktrader at the mock
 
 Set (see stocktrader `config.py` / `alpaca_client.py`):

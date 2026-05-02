@@ -48,6 +48,7 @@ Run::
 
     python mock_server.py --scenario samples/intc_day_scenario.json
     python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
+    python mock_server.py --scenario samples/intc_day_scenario.json --access-log
 
 Point stocktrader at the mock (see ``config.py`` / ``alpaca_client.py``)::
 
@@ -60,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import re
 import threading
@@ -73,6 +75,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 _NY = ZoneInfo("America/New_York")
+
+log = logging.getLogger("alpaca_mock")
 
 # Paths reachable from stocktrader main.py (see module docstring).
 _MAIN_TRADING_GET_PATHS = frozenset({"/v2/clock", "/v2/account", "/v2/positions", "/v2/orders"})
@@ -396,9 +400,97 @@ def _order_payload(
     return payload
 
 
+def _setup_access_logging() -> None:
+    if log.handlers:
+        return
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [alpaca_mock] %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(h)
+    log.setLevel(logging.INFO)
+
+
+def _access_line(server: str, command: str, raw_path: str, code: int, detail: str) -> None:
+    parsed = urlparse(raw_path)
+    q = f"?{parsed.query}" if parsed.query else ""
+    log.info("%s | %s %s%s -> %d | %s", server, command, parsed.path, q, code, detail)
+
+
+def _summary_trading(path: str, code: int, body: Any, *, empty: bool = False) -> str:
+    if empty or code == 204:
+        return "no body"
+    if code >= 400:
+        if isinstance(body, dict):
+            return (body.get("message") or str(body))[:220]
+        return str(body)[:220]
+    if path == "/v2/clock" and isinstance(body, dict):
+        return f"is_open={body.get('is_open')} timestamp={body.get('timestamp')}"
+    if path == "/v2/account" and isinstance(body, dict):
+        return f"cash={body.get('cash')} buying_power={body.get('buying_power')} equity={body.get('equity')}"
+    if path == "/v2/positions" and isinstance(body, list):
+        return f"positions={len(body)}"
+    if path == "/v2/orders" and isinstance(body, list):
+        return f"open_orders={len(body)}"
+    if path.startswith("/v2/orders/") and isinstance(body, dict):
+        oid = str(body.get("id", ""))[:8]
+        return (
+            f"order id={oid}… symbol={body.get('symbol')} status={body.get('status')} "
+            f"filled_qty={body.get('filled_qty')} filled_avg={body.get('filled_avg_price')}"
+        )
+    if path == "/v2/orders" and isinstance(body, dict) and body.get("id"):
+        return (
+            f"order_accept symbol={body.get('symbol')} side={body.get('side')} status={body.get('status')} "
+            f"qty={body.get('qty')} filled_qty={body.get('filled_qty')} filled_avg={body.get('filled_avg_price')}"
+        )
+    if isinstance(body, dict):
+        return f"keys={list(body.keys())[:8]}"
+    if isinstance(body, list):
+        return f"list n={len(body)}"
+    return str(type(body).__name__)
+
+
+def _summary_data(path: str, code: int, body: Any, state: MockState) -> str:
+    if code >= 400:
+        if isinstance(body, dict):
+            return (body.get("message") or str(body))[:220]
+        return str(body)[:220]
+    if path == "/v1/mock/status" and isinstance(body, dict):
+        return (
+            f"sim_session_minutes={body.get('sim_session_minutes')} "
+            f"synthetic_ts={body.get('synthetic_timestamp_utc')} clock={body.get('sim_clock_mode')}"
+        )
+    if path == "/v2/stocks/bars" and isinstance(body, dict):
+        bars = body.get("bars") or {}
+        parts: list[str] = []
+        for sym in sorted(bars.keys()):
+            rows = bars[sym]
+            if not rows:
+                parts.append(f"{sym}=0bars")
+                continue
+            last = rows[-1]
+            parts.append(
+                f"{sym} n={len(rows)} last_t={last.get('t')} o={last.get('o')} c={last.get('c')} v={last.get('v'):.0f}"
+                if last.get("v") is not None
+                else f"{sym} n={len(rows)} last_t={last.get('t')} c={last.get('c')}"
+            )
+        sm = f" sim_session_minutes_after_tick={state.sim_session_minutes:.4f}"
+        return "; ".join(parts) + sm
+    if path == "/v2/stocks/quotes/latest" and isinstance(body, dict):
+        q = body.get("quotes") or {}
+        parts = []
+        for sym in sorted(q.keys()):
+            row = q[sym]
+            mid = (float(row.get("bp", 0)) + float(row.get("ap", 0))) / 2.0
+            parts.append(f"{sym} t={row.get('t')} mid≈{mid:.4f} bp={row.get('bp')} ap={row.get('ap')}")
+        return "; ".join(parts)
+    if isinstance(body, dict):
+        return f"keys={list(body.keys())[:10]}"
+    return str(type(body).__name__)
+
+
 class TradingHandler(BaseHTTPRequestHandler):
     state: MockState
     log_verbose: bool = False
+    access_log: bool = False
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.log_verbose:
@@ -414,11 +506,15 @@ class TradingHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if data:
             self.wfile.write(data)
+        if self.access_log:
+            _access_line("trading", self.command, self.path, code, _summary_trading(urlparse(self.path).path, code, body))
 
     def _send_empty(self, code: int) -> None:
         self.send_response(code)
         self.send_header("Content-Length", "0")
         self.end_headers()
+        if self.access_log:
+            _access_line("trading", self.command, self.path, code, _summary_trading(urlparse(self.path).path, code, None, empty=True))
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -568,6 +664,7 @@ class TradingHandler(BaseHTTPRequestHandler):
 class DataHandler(BaseHTTPRequestHandler):
     state: MockState
     log_verbose: bool = False
+    access_log: bool = False
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.log_verbose:
@@ -580,6 +677,14 @@ class DataHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        if self.access_log:
+            _access_line(
+                "data",
+                self.command,
+                self.path,
+                code,
+                _summary_data(urlparse(self.path).path, code, body, self.state),
+            )
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -719,7 +824,12 @@ def main() -> None:
         metavar="YYYY-MM-DD",
         help="America/New_York calendar date for synthetic RTH timestamps (minute clock + --scenario only; default: last weekday ET)",
     )
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true", help="Stdlib HTTP request line logging (Apache-style)")
+    p.add_argument(
+        "--access-log",
+        action="store_true",
+        help="Log each HTTP response: trading|data, method, path, status, summary (clock, bars, quotes, orders, …)",
+    )
     args = p.parse_args()
 
     scenario_points: dict[str, list[tuple[float, float]]] | None = None
@@ -761,10 +871,16 @@ def main() -> None:
         k, v = item.split("=", 1)
         state.mock_prices[k.strip().upper()] = float(v)
 
+    access_log = args.access_log
+    if access_log:
+        _setup_access_logging()
+
     TradingHandler.state = state
     TradingHandler.log_verbose = args.verbose
+    TradingHandler.access_log = access_log
     DataHandler.state = state
     DataHandler.log_verbose = args.verbose
+    DataHandler.access_log = access_log
 
     t_srv = _run(args.host, args.trading_port, TradingHandler)
     d_srv = _run(args.host, args.data_port, DataHandler)
@@ -787,7 +903,8 @@ def main() -> None:
         f"           GET /v2/stocks/quotes/latest   GET /v2/stocks/bars (rest mode only)\n"
         f"           GET /v1/mock/status (simulation snapshot; not Alpaca)\n"
         f"{sim_line}"
-        f"Set ALPACA_TRADING_BASE_URL and ALPACA_DATA_BASE_URL (EXECUTION_MODE / ALPACA_MARKET_DATA_MODE as needed).",
+        f"Set ALPACA_TRADING_BASE_URL and ALPACA_DATA_BASE_URL (EXECUTION_MODE / ALPACA_MARKET_DATA_MODE as needed).\n"
+        f"  Response logging: {'on (--access-log)' if access_log else 'off (add --access-log to log each reply)'}",
         flush=True,
     )
     try:
