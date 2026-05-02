@@ -21,7 +21,7 @@ REST against this mock:
 - ``GET /v2/stocks/quotes/latest`` — ``AlpacaRestPollingStream`` each poll, and
   ``AlpacaPaperExecutor._fresh_entry_price`` before a buy when stream mode.
   Each call returns a **new** quote row (monotonic ``t``, 3–10 bps spread). In the
-  first ~10%% of simulated session, quotes add sustained upward drift plus
+  first ~10% of simulated session, quotes add sustained upward drift plus
   non-negative micro-jitter so opening_impulse-style quote windows see consecutive
   buying pressure; later session uses mild asymmetric noise only.
 - ``GET /v2/stocks/bars`` — ``AlpacaRestPollingStream`` only when
