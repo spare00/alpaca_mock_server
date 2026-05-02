@@ -40,4 +40,15 @@ With **minute** clock (the default when a scenario is loaded), bar and quote tim
 
 Diagnostics (not part of Alpaca’s API): `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `sim_session_minutes`, synthetic clock fields, and `market_open_flag`.
 
+### Sub-minute / 1 Hz REST
+
+By default each `GET /v2/stocks/bars` advances **one simulated session minute** and bar rows use the requested **timeframe** (e.g. `1Min`) as the step on the session curve.
+
+To align **one real second per poll** with **one session second** on the curve (e.g. stocktrader polling every second):
+
+1. Request bars with **`timeframe=1Sec`** (supported alongside `1Min`, `5Min`, …).
+2. Start the mock with **`--seconds-per-bars-tick 1`** (same as `--minutes-per-bars-tick 0.016666666666666666…`).
+
+Then each bars response advances `sim_session_minutes` by `1/60`, last-bar synthetic `t` steps by one second, and OHLC spans one session second on the scenario.
+
 Requires Python 3.9+ (stdlib only, including `zoneinfo` IANA data).

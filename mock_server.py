@@ -29,13 +29,13 @@ not implement WS.
 **Intraday simulation** (optional): pass ``--scenario`` to a JSON file (see
 ``samples/intc_day_scenario.json``). Two clocks:
 
-- **minute** (default when a scenario is loaded): a **simulated session minute**
-  counter advances by ``--minutes-per-bars-tick`` (default 1) on each
-  ``GET /v2/stocks/bars`` response — matching stocktrader's rest loop (quotes
-  then bars). Each poll moves **one minute along the curve**, so 1m OHLC and
-  quotes line up for short (seconds–minutes) trading logic. Optional JSON
-  ``session_minutes`` (default 390) is the length of one synthetic RTH day on
-  the curve before wrap.
+- **minute** (default when a scenario is loaded): a **simulated session time**
+  counter (in *session minutes*, float) advances by ``--minutes-per-bars-tick``
+  (default 1) on each ``GET /v2/stocks/bars``. For a 1 Hz REST loop with
+  sub-minute bars, use timeframe ``1Sec`` and ``--seconds-per-bars-tick 1`` so
+  each poll advances one *session second* and OHLC spans one second on the
+  curve. Optional JSON ``session_minutes`` (default 390) is the length of one
+  synthetic RTH day on the curve before wrap.
 
 - **wall**: ``u`` from wall time modulo ``--sim-cycle-seconds`` (legacy).
 
@@ -49,6 +49,7 @@ Run::
     python mock_server.py --scenario samples/intc_day_scenario.json
     python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
     python mock_server.py --scenario samples/intc_day_scenario.json --access-log
+    python mock_server.py --scenario samples/intc_day_scenario.json --seconds-per-bars-tick 1
 
 Point stocktrader at the mock (see ``config.py`` / ``alpaca_client.py``)::
 
@@ -62,7 +63,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import math
 import re
 import threading
 import time as time_module
@@ -130,11 +130,12 @@ def _utc_from_session_fminute(et_day: date, session_minute: float, session_len: 
 
 
 def _timeframe_seconds(timeframe: str) -> int | None:
-    m = re.match(r"^(\d+)(Min|Hour|Day|Week|Month)$", timeframe or "")
+    """Bar step in seconds (Alpaca-style: 1Min, 5Min, 1Sec, …). Unknown → 60."""
+    m = re.match(r"^(\d+)(Sec|Min|Hour|Day|Week|Month)$", timeframe or "", re.I)
     if not m:
         return 60
-    n, unit = int(m.group(1)), m.group(2)
-    mult = {"Min": 60, "Hour": 3600, "Day": 86400, "Week": 604800, "Month": 2592000}
+    n, unit = int(m.group(1)), m.group(2).title()
+    mult = {"Sec": 1, "Min": 60, "Hour": 3600, "Day": 86400, "Week": 604800, "Month": 2592000}
     return n * mult[unit]
 
 
@@ -163,7 +164,7 @@ class MockState:
         self.scenario_points: dict[str, list[tuple[float, float]]] = scenario_points or {}
         self.sim_clock_mode = sim_clock_mode
         self.session_minutes_total = max(1, int(session_minutes_total))
-        self.minutes_per_bars_tick = max(0.01, float(minutes_per_bars_tick))
+        self.minutes_per_bars_tick = max(1e-15, float(minutes_per_bars_tick))
         self.sim_session_minutes: float = 0.0
         self.sim_lock = threading.Lock()
         self.synthetic_rth_et_date = synthetic_rth_et_date
@@ -306,8 +307,9 @@ def _synthetic_bars_minute_clock(
     step: int,
     state: MockState,
 ) -> dict[str, list[dict[str, Any]]]:
-    """One simulated session minute per bars request; 1m OHLC from scenario knots."""
+    """Session-clock bars: each row spans ``step`` seconds on the session timeline (step/60 session minutes)."""
     session_len = float(state.session_minutes_total)
+    span_session_minutes = max(float(step) / 60.0, 1e-15)
     times: list[datetime] = []
     t = start_dt
     i = 0
@@ -320,15 +322,15 @@ def _synthetic_bars_minute_clock(
 
     out: dict[str, list[dict[str, Any]]] = {s: [] for s in symbols}
     with state.sim_lock:
-        cur = int(math.floor(state.sim_session_minutes))
+        cur = float(state.sim_session_minutes)
         n = len(times)
         for sym in symbols:
             pts = state.scenario_points.get(sym)
             for j, t_open in enumerate(times):
-                bm = cur - (n - 1 - j)
+                start_m = cur - (n - 1 - j) * span_session_minutes
                 if pts:
-                    o = _mid_from_session_minute(pts, float(bm), session_len)
-                    c = _mid_from_session_minute(pts, float(bm + 1), session_len)
+                    o = _mid_from_session_minute(pts, start_m, session_len)
+                    c = _mid_from_session_minute(pts, start_m + span_session_minutes, session_len)
                 else:
                     px = float(state.mock_prices[sym])
                     o = c = px
@@ -339,7 +341,7 @@ def _synthetic_bars_minute_clock(
                     vol += 5000.0
                 if state.synthetic_rth_et_date is not None:
                     t_bar = _utc_from_session_fminute(
-                        state.synthetic_rth_et_date, float(bm), session_len
+                        state.synthetic_rth_et_date, float(start_m), session_len
                     )
                     t_iso = _iso(t_bar)
                 else:
@@ -815,7 +817,14 @@ def main() -> None:
         "--minutes-per-bars-tick",
         type=float,
         default=1.0,
-        help="Simulated session minutes to advance after each GET /v2/stocks/bars (minute clock only)",
+        help="Simulated session minutes to advance after each GET /v2/stocks/bars (minute clock only; fractional ok)",
+    )
+    p.add_argument(
+        "--seconds-per-bars-tick",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Sets --minutes-per-bars-tick to SEC/60 (e.g. 1 with 1Sec bars = one session-second per poll)",
     )
     p.add_argument(
         "--session-date",
@@ -831,6 +840,10 @@ def main() -> None:
         help="Log each HTTP response: trading|data, method, path, status, summary (clock, bars, quotes, orders, …)",
     )
     args = p.parse_args()
+    if args.seconds_per_bars_tick is not None:
+        if args.seconds_per_bars_tick < 0:
+            p.error("--seconds-per-bars-tick must be >= 0")
+        args.minutes_per_bars_tick = args.seconds_per_bars_tick / 60.0
 
     scenario_points: dict[str, list[tuple[float, float]]] | None = None
     file_cycle: float | None = None
