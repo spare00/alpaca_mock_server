@@ -20,9 +20,10 @@ REST against this mock:
 
 - ``GET /v2/stocks/quotes/latest`` — ``AlpacaRestPollingStream`` each poll, and
   ``AlpacaPaperExecutor._fresh_entry_price`` before a buy when stream mode.
-  Each call returns a **new** quote row (monotonic ``t``, tick noise, 3–10 bps
-  spread, occasional micro-spike) so quote-window strategies can accumulate
-  multiple updates per session minute.
+  Each call returns a **new** quote row (monotonic ``t``, 3–10 bps spread). In the
+  first ~10%% of simulated session, quotes add sustained upward drift plus
+  non-negative micro-jitter so opening_impulse-style quote windows see consecutive
+  buying pressure; later session uses mild asymmetric noise only.
 - ``GET /v2/stocks/bars`` — ``AlpacaRestPollingStream`` only when
   ``ALPACA_MARKET_DATA_MODE=rest`` (not used on the default stream path)
 
@@ -199,11 +200,15 @@ class MockState:
             self.quote_last_emit_utc = dt
 
         base_price = self.mid_price(sym, dt)
-        noise = ((tick % 5) - 2) * 0.002
-        price = base_price * (1.0 + noise)
-        phase = (tick % 100) / 100.0
-        if 0.05 < phase < 0.10:
-            price *= 1.01
+        session_len = float(self.session_minutes_total)
+        session_phase = (sm % session_len) / session_len if session_len > 0 else 0.0
+        if session_phase < 0.1:
+            drift = 0.0015
+            noise = (tick % 2) * 0.0002
+        else:
+            drift = 0.0
+            noise = ((tick % 3) - 1) * 0.0005
+        price = base_price * (1.0 + drift + noise)
         spread_bps = 0.0003 + (tick % 8) * 0.0001
         spread = max(0.01, price * spread_bps)
         return _iso(dt), float(price), float(spread)
