@@ -19,7 +19,10 @@ REST against this mock:
 **Market data** (``http://127.0.0.1:<data-port>``):
 
 - ``GET /v2/stocks/quotes/latest`` — ``AlpacaRestPollingStream`` each poll, and
-  ``AlpacaPaperExecutor._fresh_entry_price`` before a buy when stream mode
+  ``AlpacaPaperExecutor._fresh_entry_price`` before a buy when stream mode.
+  Each call returns a **new** quote row (monotonic ``t``, tick noise, 3–10 bps
+  spread, occasional micro-spike) so quote-window strategies can accumulate
+  multiple updates per session minute.
 - ``GET /v2/stocks/bars`` — ``AlpacaRestPollingStream`` only when
   ``ALPACA_MARKET_DATA_MODE=rest`` (not used on the default stream path)
 
@@ -168,6 +171,42 @@ class MockState:
         self.sim_session_minutes: float = 0.0
         self.sim_lock = threading.Lock()
         self.synthetic_rth_et_date = synthetic_rth_et_date
+        self.quote_tick_index: int = 0
+        self.quote_lock = threading.Lock()
+        self.quote_last_emit_utc: datetime | None = None
+
+    def next_quote(self, symbol: str) -> tuple[str, float, float]:
+        """Next synthetic quote: monotonic UTC ``t``, mid, half-spread width (bps-sized)."""
+        sym = symbol.upper()
+        with self.sim_lock:
+            sm = float(self.sim_session_minutes)
+        if self.synthetic_rth_et_date is not None:
+            base_dt = _utc_from_session_fminute(
+                self.synthetic_rth_et_date,
+                sm,
+                float(self.session_minutes_total),
+            )
+        else:
+            base_dt = _utc_now()
+
+        with self.quote_lock:
+            self.quote_tick_index += 1
+            tick = self.quote_tick_index
+            candidate = base_dt + timedelta(milliseconds=100 * tick)
+            if self.quote_last_emit_utc is not None:
+                candidate = max(candidate, self.quote_last_emit_utc + timedelta(microseconds=1))
+            dt = max(candidate, base_dt)
+            self.quote_last_emit_utc = dt
+
+        base_price = self.mid_price(sym, dt)
+        noise = ((tick % 5) - 2) * 0.002
+        price = base_price * (1.0 + noise)
+        phase = (tick % 100) / 100.0
+        if 0.05 < phase < 0.10:
+            price *= 1.01
+        spread_bps = 0.0003 + (tick % 8) * 0.0001
+        spread = max(0.01, price * spread_bps)
+        return _iso(dt), float(price), float(spread)
 
     def virtual_u(self, at: datetime) -> float:
         t = _as_utc_timestamp(at)
@@ -715,6 +754,7 @@ class DataHandler(BaseHTTPRequestHandler):
                     else None,
                     "synthetic_timestamp_utc": syn,
                     "market_open_flag": st.market_open,
+                    "quote_tick_index": st.quote_tick_index,
                 },
             )
             return
@@ -746,21 +786,11 @@ class DataHandler(BaseHTTPRequestHandler):
         if path == "/v2/stocks/quotes/latest":
             symbols = (qs.get("symbols") or [""])[0].split(",")
             symbols = [s.strip().upper() for s in symbols if s.strip()]
-            if self.state.synthetic_rth_et_date is not None:
-                now_dt = _utc_from_session_fminute(
-                    self.state.synthetic_rth_et_date,
-                    self.state.sim_session_minutes,
-                    float(self.state.session_minutes_total),
-                )
-            else:
-                now_dt = _utc_now()
-            now = _iso(now_dt)
             quotes: dict[str, dict[str, Any]] = {}
             for sym in symbols:
-                mid = self.state.mid_price(sym, now_dt)
-                spread = max(0.01, mid * 0.0005)
+                t, mid, spread = self.state.next_quote(sym)
                 quotes[sym] = {
-                    "t": now,
+                    "t": t,
                     "bp": mid - spread / 2,
                     "ap": mid + spread / 2,
                     "bs": 100.0,
