@@ -63,10 +63,10 @@ import json
 import math
 import re
 import threading
-import time
+import time as time_module
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time as time_of_day, timedelta, timezone
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -116,7 +116,7 @@ def _default_et_session_date() -> date:
 
 
 def _et_open_datetime(d: date) -> datetime:
-    return datetime.combine(d, time(9, 30), tzinfo=_NY)
+    return datetime.combine(d, time_of_day(9, 30), tzinfo=_NY)
 
 
 def _utc_from_session_fminute(et_day: date, session_minute: float, session_len: float) -> datetime:
@@ -152,7 +152,9 @@ class MockState:
         self.market_open = market_open
         self.orders: dict[str, dict[str, Any]] = {}
         self.mock_prices: dict[str, float] = defaultdict(lambda: 100.0)
-        self.sim_anchor_epoch = float(sim_anchor_epoch if sim_anchor_epoch is not None else time.time())
+        self.sim_anchor_epoch = float(
+            sim_anchor_epoch if sim_anchor_epoch is not None else time_module.time()
+        )
         self.sim_cycle_seconds = max(60.0, float(sim_cycle_seconds))
         self.scenario_points: dict[str, list[tuple[float, float]]] = scenario_points or {}
         self.sim_clock_mode = sim_clock_mode
