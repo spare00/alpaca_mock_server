@@ -31,7 +31,7 @@ Stream mode still uses Alpaca WebSockets for live bars/quotes; this mock does
 not implement WS.
 
 **Intraday simulation** (optional): pass ``--scenario`` to a JSON file (see
-``samples/intc_day_scenario.json``). Two clocks:
+``samples/intc_may01_chart_scenario.json``). Two clocks:
 
 - **minute** (default when a scenario is loaded): a **simulated session time**
   counter (in *session minutes*, float) advances by ``--minutes-per-bars-tick``
@@ -51,10 +51,10 @@ Override the calendar day with ``--session-date YYYY-MM-DD`` (ET).
 
 Run::
 
-    python mock_server.py --scenario samples/intc_day_scenario.json
-    python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
-    python mock_server.py --scenario samples/intc_day_scenario.json --access-log
-    python mock_server.py --scenario samples/intc_day_scenario.json --seconds-per-bars-tick 1
+    python mock_server.py --scenario samples/intc_may01_chart_scenario.json
+    python mock_server.py --scenario samples/intc_may01_chart_scenario.json --sim-clock wall --sim-cycle-seconds 3600
+    python mock_server.py --scenario samples/intc_may01_chart_scenario.json --access-log
+    python mock_server.py --scenario samples/intc_may01_chart_scenario.json --seconds-per-bars-tick 1
 
 Point stocktrader at the mock (see ``config.py`` / ``alpaca_client.py``)::
 
@@ -932,7 +932,7 @@ def main() -> None:
         "--scenario",
         type=str,
         default=None,
-        help="JSON file with intraday curves (see samples/intc_day_scenario.json)",
+        help="JSON file with intraday curves (see samples/intc_may01_chart_scenario.json)",
     )
     p.add_argument(
         "--sim-cycle-seconds",

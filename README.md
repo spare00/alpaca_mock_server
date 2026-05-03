@@ -5,8 +5,8 @@ Local HTTP mock of the Alpaca REST endpoints used by **stocktrader** (`stocktrad
 ## Run
 
 ```bash
-python mock_server.py --scenario samples/intc_day_scenario.json
-python mock_server.py --scenario samples/intc_day_scenario.json --sim-clock wall --sim-cycle-seconds 3600
+python mock_server.py --scenario samples/intc_may01_chart_scenario.json
+python mock_server.py --scenario samples/intc_may01_chart_scenario.json --sim-clock wall --sim-cycle-seconds 3600
 ```
 
 Add **`--access-log`** to print each HTTP reply (trading vs data port, status, and a short summary: clock fields, last bar OHLC, quote mids, order status, etc.). Use **`-v`** separately for stdlib-style request lines.
@@ -34,7 +34,7 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 
 ## Scenarios
 
-Optional `--scenario` JSON (see `samples/intc_day_scenario.json`). Additional hand-traced curves from May 2026 INTC 1m screenshots: `samples/intc_session_may03_chart_a_scenario.json`, `samples/intc_session_may03_chart_b_scenario.json`. Simulated session timing and `--minutes-per-bars-tick` / `--sim-clock` / `--sim-cycle-seconds` are documented in `mock_server.py`.
+Optional `--scenario` JSON; the repo includes one versioned example (`samples/intc_may01_chart_scenario.json` + `samples/INTC_2026-05-01.png`). Other files under `samples/` are **gitignored**—add your own scenarios or screenshots there locally. Timing flags `--minutes-per-bars-tick` / `--sim-clock` / `--sim-cycle-seconds` are documented in `mock_server.py`.
 
 With **minute** clock (the default when a scenario is loaded), bar and quote timestamps and `GET /v2/clock`’s `timestamp` are aligned to a **synthetic US/Eastern RTH day** (09:30 + simulated session minute). That matches clients that filter on regular market hours (e.g. `regular_market_only`) while you run the stack at night. Set the calendar day explicitly with `--session-date YYYY-MM-DD` (interpreted in `America/New_York`).
 

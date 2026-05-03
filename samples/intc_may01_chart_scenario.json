@@ -1,5 +1,5 @@
 {
-  "_comment": "INTC-style session from chart sample (1m chart, ~9:30–16:00 ET). u = fraction of regular session [0,1]. With mock --scenario (default minute clock), one GET /v2/stocks/bars advances one simulated minute along this curve. session_minutes: synthetic RTH length before wrap (default 390). cycle_seconds: only for --sim-clock wall.",
+  "_comment": "INTC May 1 session (1m, ~9:30–16:00 ET). Companion screenshot: samples/INTC_2026-05-01.png. u = fraction of regular session [0,1]. With mock --scenario (default minute clock), one GET /v2/stocks/bars advances one simulated minute along this curve. session_minutes: synthetic RTH length before wrap (default 390). cycle_seconds: only for --sim-clock wall.",
   "session_minutes": 390,
   "cycle_seconds": 7200,
   "symbols": {

@@ -15,6 +15,12 @@ env/
 # OS
 .DS_Store
 
+# samples/: only the May 1 INTC example (screenshot + scenario JSON) is tracked;
+# keep other charts / scenarios locally.
+samples/*
+!samples/INTC_2026-05-01.png
+!samples/intc_may01_chart_scenario.json
+
 # Editors / IDEs
 .idea/
 .vscode/
