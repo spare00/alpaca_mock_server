@@ -35,8 +35,9 @@ not implement WS.
 
 - **minute** (default when a scenario is loaded): a **simulated session time**
   counter (in *session minutes*, float) advances by ``--minutes-per-bars-tick``
-  (default 1) on each ``GET /v2/stocks/bars``. For a 1 Hz REST loop with
-  sub-minute bars, use timeframe ``1Sec`` and ``--seconds-per-bars-tick 1`` so
+  (default 1) on each ``GET /v2/stocks/bars``, never less than one requested bar
+  span. For a 1 Hz REST loop with sub-minute bars, use timeframe ``1Sec`` and
+  ``--seconds-per-bars-tick 1`` so
   each poll advances one *session second* and OHLC spans one second on the
   curve. Optional JSON ``session_minutes`` (default 390) is the length of one
   synthetic RTH day on the curve before wrap.
@@ -162,6 +163,10 @@ def _utc_from_session_fminute(et_day: date, session_minute: float, session_len: 
     return (_et_open_datetime(et_day) + timedelta(minutes=m)).astimezone(timezone.utc)
 
 
+def _utc_from_session_minute_no_wrap(et_day: date, session_minute: float) -> datetime:
+    return (_et_open_datetime(et_day) + timedelta(minutes=float(session_minute))).astimezone(timezone.utc)
+
+
 def _timeframe_seconds(timeframe: str) -> int | None:
     """Bar step in seconds (Alpaca-style: 1Min, 5Min, 1Sec, …). Unknown → 60."""
     m = re.match(r"^(\d+)(Sec|Min|Hour|Day|Week|Month)$", timeframe or "", re.I)
@@ -213,22 +218,20 @@ class MockState:
         sym = symbol.upper()
         with self.sim_lock:
             sm = float(self.sim_session_minutes)
-        if self.synthetic_rth_et_date is not None:
-            base_dt = _utc_from_session_fminute(
-                self.synthetic_rth_et_date,
-                sm,
-                float(self.session_minutes_total),
-            )
-        else:
-            base_dt = _utc_now()
 
         with self.quote_lock:
             self.quote_tick_index += 1
             tick = self.quote_tick_index
-            candidate = base_dt + timedelta(milliseconds=100 * tick)
+            if self.synthetic_rth_et_date is not None:
+                candidate = _utc_from_session_minute_no_wrap(
+                    self.synthetic_rth_et_date,
+                    sm,
+                ) + timedelta(seconds=tick)
+            else:
+                candidate = _utc_now()
             if self.quote_last_emit_utc is not None:
                 candidate = max(candidate, self.quote_last_emit_utc + timedelta(microseconds=1))
-            dt = max(candidate, base_dt)
+            dt = candidate
             self.quote_last_emit_utc = dt
 
         base_price = self.mid_price(sym, dt)
@@ -492,6 +495,8 @@ def _synthetic_bars_minute_clock(
             pts = state.scenario_points.get(sym)
             for j, t_open in enumerate(times):
                 start_m = cur - (n - 1 - j) * span_session_minutes
+                if start_m < 0 or start_m >= session_len:
+                    continue
                 if pts:
                     o = _mid_from_session_minute(pts, start_m, session_len)
                     c = _mid_from_session_minute(pts, start_m + span_session_minutes, session_len)
@@ -504,9 +509,7 @@ def _synthetic_bars_minute_clock(
                 if abs(c - o) > 0.03:
                     vol += 5000.0
                 if state.synthetic_rth_et_date is not None:
-                    t_bar = _utc_from_session_fminute(
-                        state.synthetic_rth_et_date, float(start_m), session_len
-                    )
+                    t_bar = _utc_from_session_minute_no_wrap(state.synthetic_rth_et_date, float(start_m))
                     t_iso = _iso(t_bar)
                 else:
                     t_iso = _iso(t_open)
@@ -522,7 +525,7 @@ def _synthetic_bars_minute_clock(
                         "vw": (o + c) / 2,
                     }
                 )
-        state.sim_session_minutes += state.minutes_per_bars_tick
+        state.sim_session_minutes += max(state.minutes_per_bars_tick, span_session_minutes)
     return out
 
 

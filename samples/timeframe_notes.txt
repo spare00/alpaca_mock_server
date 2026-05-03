@@ -1,6 +1,6 @@
 Stocktrader main.py + ALPACA_MARKET_DATA_MODE=rest uses 1-minute bars and latest quotes (see alpaca_stream.py). The mock matches timeframe=1Min from the client.
 
-Minute clock (default when using --scenario): each AlpacaRestPollingStream iteration does get_stock_latest_quote then get_bars_between. The mock advances a simulated "session minute" counter once per bars response, so each poll sees the next minute of OHLC along your JSON curve. That matches short (seconds–minutes) behavior without stretching the curve by wall-clock duration.
+Minute clock (default when using --scenario): each AlpacaRestPollingStream iteration does get_stock_latest_quote then get_bars_between. With stocktrader's 1Min bars, the mock advances a simulated "session minute" counter once per bars response, so each poll sees the next minute of OHLC along your JSON curve. That matches short (seconds–minutes) behavior without stretching the curve by wall-clock duration.
 
 For more detail on the curve itself: add more [u, price] knots in the JSON. For legacy time-stretch testing without minute clock: --sim-clock wall --sim-cycle-seconds <N>.
 

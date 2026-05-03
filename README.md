@@ -49,6 +49,6 @@ To align **one real second per poll** with **one session second** on the curve (
 1. Request bars with **`timeframe=1Sec`** (supported alongside `1Min`, `5Min`, …).
 2. Start the mock with **`--seconds-per-bars-tick 1`** (same as `--minutes-per-bars-tick 0.016666666666666666…`).
 
-Then each bars response advances `sim_session_minutes` by `1/60`, last-bar synthetic `t` steps by one second, and OHLC spans one session second on the scenario.
+Then each `1Sec` bars response advances `sim_session_minutes` by `1/60`, last-bar synthetic `t` steps by one second, and OHLC spans one session second on the scenario. For stocktrader's default `1Min` REST bars, the mock advances at least one synthetic minute per bars response so opening-range logic sees new minute bars.
 
 Requires Python 3.9+ (stdlib only, including `zoneinfo` IANA data).
