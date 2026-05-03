@@ -19,6 +19,9 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 - `ALPACA_DATA_BASE_URL=http://127.0.0.1:19902`
 - `ALPACA_API_KEY=test`
 - `ALPACA_SECRET_KEY=test`
+- `REPLAY_MARKET_DATA=true`
+
+Use `REPLAY_MARKET_DATA=true` when stocktrader consumes historical/mock scenarios. It keeps strategy timing, max-hold, min-hold, cooldowns, and shutdown flatten logic on the mock event clock instead of the wall clock.
 
 ## What is mocked
 
