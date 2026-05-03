@@ -73,6 +73,7 @@ import time as time_module
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, time as time_of_day, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -86,6 +87,7 @@ log = logging.getLogger("alpaca_mock")
 _MAIN_TRADING_GET_PATHS = frozenset({"/v2/clock", "/v2/account", "/v2/positions", "/v2/orders"})
 _MAIN_TRADING_ORDER_UUID = re.compile(r"^/v2/orders/([0-9a-f-]{36})$", re.I)
 _MAIN_DATA_PATHS = frozenset({"/v2/stocks/bars", "/v2/stocks/quotes/latest"})
+_TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 
 
 def _utc_now() -> datetime:
@@ -111,6 +113,33 @@ def _parse_iso(s: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _decimal_value(value: Any, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(default)
+
+
+def _money(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'))}"
+
+
+def _decimal_str(value: Decimal) -> str:
+    return format(value.normalize(), "f")
+
+
+def _order_matches_status_filter(order_status: str, status_filter: str) -> bool:
+    status = order_status.lower()
+    requested = status_filter.lower()
+    if requested == "all":
+        return True
+    if requested == "closed":
+        return status in _TERMINAL_ORDER_STATUSES
+    if requested == "open":
+        return status not in _TERMINAL_ORDER_STATUSES
+    return status == requested
 
 
 def _default_et_session_date() -> date:
@@ -158,8 +187,11 @@ class MockState:
         synthetic_rth_et_date: date | None = None,
     ) -> None:
         self.starting_cash = starting_cash
+        self.cash = _decimal_value(starting_cash)
         self.market_open = market_open
         self.orders: dict[str, dict[str, Any]] = {}
+        self.positions: dict[str, dict[str, Decimal]] = {}
+        self.account_lock = threading.Lock()
         self.mock_prices: dict[str, float] = defaultdict(lambda: 100.0)
         self.sim_anchor_epoch = float(
             sim_anchor_epoch if sim_anchor_epoch is not None else time_module.time()
@@ -229,6 +261,94 @@ class MockState:
                 return _mid_from_session_minute(pts, sm, float(self.session_minutes_total))
             return _interp_points(pts, self.virtual_u(at))
         return float(self.mock_prices[sym])
+
+    def account_payload(self) -> dict[str, Any]:
+        with self.account_lock:
+            cash = self.cash
+            market_value = Decimal("0")
+            for sym, pos in self.positions.items():
+                qty = pos["qty"]
+                px = _decimal_value(self.mid_price(sym, _utc_now()))
+                market_value += qty * px
+            equity = cash + market_value
+            buying_power = cash
+        c = _money(cash)
+        e = _money(equity)
+        bp = _money(buying_power)
+        return {
+            "id": str(uuid.uuid4()),
+            "account_number": "MOCK-0001",
+            "status": "ACTIVE",
+            "currency": "USD",
+            "cash": c,
+            "buying_power": bp,
+            "portfolio_value": e,
+            "equity": e,
+            "pattern_day_trader": False,
+            "trading_blocked": False,
+            "transfers_blocked": False,
+            "account_blocked": False,
+            "multiplier": "1",
+            "shorting_enabled": True,
+        }
+
+    def position_payloads(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        with self.account_lock:
+            snapshot = [(sym, pos["qty"], pos["avg_entry_price"]) for sym, pos in self.positions.items()]
+        for sym, qty, avg_entry in snapshot:
+            if qty == 0:
+                continue
+            current = _decimal_value(self.mid_price(sym, _utc_now()))
+            market_value = qty * current
+            cost_basis = qty * avg_entry
+            unrealized = market_value - cost_basis
+            out.append(
+                {
+                    "asset_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, sym)),
+                    "symbol": sym,
+                    "exchange": "NASDAQ",
+                    "asset_class": "us_equity",
+                    "asset_marginable": True,
+                    "qty": _decimal_str(qty),
+                    "avg_entry_price": _decimal_str(avg_entry),
+                    "side": "long" if qty >= 0 else "short",
+                    "market_value": _money(market_value),
+                    "cost_basis": _money(cost_basis),
+                    "unrealized_pl": _money(unrealized),
+                    "unrealized_plpc": _decimal_str(unrealized / cost_basis) if cost_basis else "0",
+                    "current_price": _decimal_str(current),
+                    "lastday_price": _decimal_str(current),
+                    "change_today": "0",
+                }
+            )
+        return out
+
+    def apply_fill(self, order: dict[str, Any]) -> None:
+        sym = str(order.get("symbol") or "").upper()
+        if not sym:
+            return
+        qty = _decimal_value(order.get("filled_qty") or order.get("qty"), "0")
+        px = _decimal_value(order.get("filled_avg_price"), "0")
+        if qty <= 0 or px <= 0:
+            return
+        side = str(order.get("side") or "buy").lower()
+        signed_qty = qty if side == "buy" else -qty
+        with self.account_lock:
+            self.cash -= signed_qty * px
+            pos = self.positions.get(sym)
+            if pos is None:
+                self.positions[sym] = {"qty": signed_qty, "avg_entry_price": px}
+                return
+            old_qty = pos["qty"]
+            old_avg = pos["avg_entry_price"]
+            new_qty = old_qty + signed_qty
+            if new_qty == 0:
+                self.positions.pop(sym, None)
+                return
+            if old_qty == 0 or (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
+                pos["avg_entry_price"] = ((old_qty * old_avg) + (signed_qty * px)) / new_qty
+            pos["qty"] = new_qty
 
 
 def _as_utc_timestamp(dt: datetime) -> float:
@@ -600,39 +720,19 @@ class TradingHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v2/account":
-            c = f"{self.state.starting_cash:.2f}"
-            self._send(
-                200,
-                {
-                    "id": str(uuid.uuid4()),
-                    "account_number": "MOCK-0001",
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "cash": c,
-                    "buying_power": c,
-                    "portfolio_value": c,
-                    "equity": c,
-                    "pattern_day_trader": False,
-                    "trading_blocked": False,
-                    "transfers_blocked": False,
-                    "account_blocked": False,
-                    "multiplier": "1",
-                    "shorting_enabled": True,
-                },
-            )
+            self._send(200, self.state.account_payload())
             return
 
         if path == "/v2/positions":
-            self._send(200, [])
+            self._send(200, self.state.position_payloads())
             return
 
         if path == "/v2/orders":
-            status_filter = (qs.get("status") or [None])[0]
+            status_filter = ((qs.get("status") or ["open"])[0] or "open").lower()
             out = []
             for o in self.state.orders.values():
-                if status_filter and o.get("status") != status_filter:
-                    continue
-                if o.get("status") not in ("filled", "canceled", "expired", "rejected", "done_for_day"):
+                order_status = str(o.get("status") or "").lower()
+                if _order_matches_status_filter(order_status, status_filter):
                     out.append(o)
             self._send(200, out)
             return
@@ -679,6 +779,7 @@ class TradingHandler(BaseHTTPRequestHandler):
         if self.state.market_open and (body.get("type") or "market").lower() == "market":
             st = "filled"
             o = _order_payload(oid, body, st, None, px, now)
+            self.state.apply_fill(o)
         else:
             st = "accepted"
             o = _order_payload(oid, body, st, "0", None, now)
@@ -930,8 +1031,16 @@ def main() -> None:
     DataHandler.log_verbose = args.verbose
     DataHandler.access_log = access_log
 
-    t_srv = _run(args.host, args.trading_port, TradingHandler)
-    d_srv = _run(args.host, args.data_port, DataHandler)
+    t_srv: ThreadingHTTPServer | None = None
+    d_srv: ThreadingHTTPServer | None = None
+    try:
+        t_srv = _run(args.host, args.trading_port, TradingHandler)
+        d_srv = _run(args.host, args.data_port, DataHandler)
+    except Exception:
+        if t_srv is not None:
+            t_srv.shutdown()
+            t_srv.server_close()
+        raise
 
     sim_line = ""
     if scenario_points:
@@ -960,8 +1069,12 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nShutting down.", flush=True)
     finally:
-        t_srv.shutdown()
-        d_srv.shutdown()
+        if t_srv is not None:
+            t_srv.shutdown()
+            t_srv.server_close()
+        if d_srv is not None:
+            d_srv.shutdown()
+            d_srv.server_close()
 
 
 if __name__ == "__main__":
