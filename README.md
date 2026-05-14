@@ -2,14 +2,32 @@
 
 Local HTTP mock of the Alpaca REST endpoints used by **stocktrader** (`stocktrader/main.py` via alpaca-py). WebSocket market data is not implemented here.
 
+## `.env` file
+
+You do not need to `export` variables: place a **`.env`** file next to `mock_server.py` (or in the current working directory when you start the server). The server loads it **before** parsing CLI flags, using `setdefault` so existing shell variables still win.
+
+Optional: `python mock_server.py --env-file /path/to/other.env`
+
+See **`env.example`** for supported variable names (`ALPACA_MOCK_*`, `ALPACA_UPSTREAM_*`).
+
+## Modes
+
+**Alpaca historical replay (`--alpaca-date` or `ALPACA_MOCK_ALPACA_DATE` in `.env`)**  
+The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping request times onto that US/Eastern calendar day. Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock).
+
+**Local synthetic (default)**  
+Without `--alpaca-date`, bars and quotes are generated locally from `--price SYM=PRICE` (repeatable) and default mids (`100` per symbol).
+
+**Trading** is always local (paper mock): clock, account, positions, orders.
+
 ## Run
 
 ```bash
-python mock_server.py --scenario samples/intc_may01_chart_scenario.json
-python mock_server.py --scenario samples/intc_may01_chart_scenario.json --sim-clock wall --sim-cycle-seconds 3600
+python mock_server.py --access-log
+python mock_server.py --price INTC=35.5 --access-log
 ```
 
-Add **`--access-log`** to print each HTTP reply (trading vs data port, status, and a short summary: clock fields, last bar OHLC, quote mids, order status, etc.). Use **`-v`** separately for stdlib-style request lines.
+Add **`-v`** for stdlib-style HTTP request lines.
 
 ## Point stocktrader at the mock
 
@@ -19,11 +37,9 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 - `ALPACA_DATA_BASE_URL=http://127.0.0.1:19902`
 - `ALPACA_API_KEY=test`
 - `ALPACA_SECRET_KEY=test`
-- `REPLAY_MARKET_DATA=true`
+- `REPLAY_MARKET_DATA=true` when you want stocktrader’s replay timing tied to the mock clock instead of wall clock (see stocktrader docs).
 
-Use `REPLAY_MARKET_DATA=true` when stocktrader consumes historical/mock scenarios. It keeps strategy timing, max-hold, min-hold, cooldowns, and shutdown flatten logic on the mock event clock instead of the wall clock.
-
-## What is mocked
+## What is implemented
 
 **Trading** (`127.0.0.1:<trading-port>`) when `EXECUTION_MODE=alpaca_paper`:
 
@@ -35,23 +51,6 @@ Use `REPLAY_MARKET_DATA=true` when stocktrader consumes historical/mock scenario
 - `GET /v2/stocks/quotes/latest`
 - `GET /v2/stocks/bars` (when `ALPACA_MARKET_DATA_MODE=rest`)
 
-## Scenarios
+Diagnostics: `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `data_mode` (`local_synthetic` or `alpaca_replay`), `sim_session_minutes` (meaningful in replay mode), `market_open_flag`, `quote_tick_index`, and replay fields when applicable.
 
-Optional `--scenario` JSON; the repo includes one versioned example (`samples/intc_may01_chart_scenario.json` + `samples/INTC_2026-05-01.png`). Other files under `samples/` are **gitignored**—add your own scenarios or screenshots there locally. Timing flags `--minutes-per-bars-tick` / `--sim-clock` / `--sim-cycle-seconds` are documented in `mock_server.py`.
-
-With **minute** clock (the default when a scenario is loaded), bar and quote timestamps and `GET /v2/clock`’s `timestamp` are aligned to a **synthetic US/Eastern RTH day** (09:30 + simulated session minute). That matches clients that filter on regular market hours (e.g. `regular_market_only`) while you run the stack at night. Set the calendar day explicitly with `--session-date YYYY-MM-DD` (interpreted in `America/New_York`).
-
-Diagnostics (not part of Alpaca’s API): `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `sim_session_minutes`, synthetic clock fields, and `market_open_flag`.
-
-### Sub-minute / 1 Hz REST
-
-By default each `GET /v2/stocks/bars` advances **one simulated session minute** and bar rows use the requested **timeframe** (e.g. `1Min`) as the step on the session curve.
-
-To align **one real second per poll** with **one session second** on the curve (e.g. stocktrader polling every second):
-
-1. Request bars with **`timeframe=1Sec`** (supported alongside `1Min`, `5Min`, …).
-2. Start the mock with **`--seconds-per-bars-tick 1`** (same as `--minutes-per-bars-tick 0.016666666666666666…`).
-
-Then each `1Sec` bars response advances `sim_session_minutes` by `1/60`, last-bar synthetic `t` steps by one second, and OHLC spans one session second on the scenario. For stocktrader's default `1Min` REST bars, the mock advances at least one synthetic minute per bars response so opening-range logic sees new minute bars.
-
-Requires Python 3.9+ (stdlib only, including `zoneinfo` IANA data).
+Requires Python 3.9+ (stdlib only for the server; `--alpaca-date` uses `urllib` to call Alpaca’s HTTPS data API).
