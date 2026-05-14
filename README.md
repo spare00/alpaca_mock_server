@@ -13,7 +13,7 @@ See **`env.example`** for supported variable names (`ALPACA_MOCK_*`, `ALPACA_UPS
 ## Modes
 
 **Alpaca historical replay (`--alpaca-date` or `ALPACA_MOCK_ALPACA_DATE` in `.env`)**  
-The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. By default the replay clock is pinned to `09:30` New York time; override it with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2024-05-13 --alpaca-time 09:35`). Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock).
+The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. By default the replay clock starts at `09:30` New York time and advances with server runtime; override the start time with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2024-05-13 --alpaca-time 09:35`). Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock).
 
 **Local synthetic (default)**  
 Without `--alpaca-date`, bars and quotes are generated locally from `--price SYM=PRICE` (repeatable) and default mids (`100` per symbol).

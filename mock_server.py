@@ -33,8 +33,9 @@ not implement WS.
 
 **Alpaca historical replay:** pass ``--alpaca-date YYYY-MM-DD`` (and upstream API
 keys in ``.env`` or flags). Data routes proxy to Alpaca’s Data API with runtime
-request times shifted onto that US/Eastern calendar day and replay clock time
-(``--alpaca-time HH:MM``, default ``09:30``). Trading routes stay local.
+request times shifted onto that US/Eastern calendar day, starting at replay
+clock time (``--alpaca-time HH:MM``, default ``09:30``) and then advancing with
+server runtime. Trading routes stay local.
 
 Run (local synthetic data)::
 
@@ -297,10 +298,23 @@ class MockState:
         self.quote_last_emit_utc: datetime | None = None
         self.alpaca_historical_et_date = alpaca_historical_et_date
         self.alpaca_historical_et_time = alpaca_historical_et_time
+        self.replay_wall_started_utc = _utc_now()
+        self.replay_started_utc = self._initial_replay_utc()
         self.upstream_data_url = (upstream_data_url or "https://data.alpaca.markets").rstrip("/")
         self.upstream_trading_url = (upstream_trading_url or "https://paper-api.alpaca.markets").rstrip("/")
         self.upstream_api_key = upstream_api_key
         self.upstream_secret_key = upstream_secret_key
+
+    def _initial_replay_utc(self) -> datetime | None:
+        if self.alpaca_historical_et_date is None:
+            return None
+        if self.alpaca_historical_et_time is not None:
+            return datetime.combine(
+                self.alpaca_historical_et_date,
+                self.alpaca_historical_et_time,
+                tzinfo=_NY,
+            ).astimezone(timezone.utc)
+        return snap_datetime_to_target_et_date(self.replay_wall_started_utc, self.alpaca_historical_et_date)
 
     def refresh_replay_clock_from_wall(self) -> None:
         if self.alpaca_historical_et_date is None:
@@ -310,13 +324,9 @@ class MockState:
     def replay_now_utc(self) -> datetime:
         if self.alpaca_historical_et_date is None:
             return _utc_now()
-        if self.alpaca_historical_et_time is not None:
-            return datetime.combine(
-                self.alpaca_historical_et_date,
-                self.alpaca_historical_et_time,
-                tzinfo=_NY,
-            ).astimezone(timezone.utc)
-        return snap_datetime_to_target_et_date(_utc_now(), self.alpaca_historical_et_date)
+        if self.replay_started_utc is None:
+            return snap_datetime_to_target_et_date(_utc_now(), self.alpaca_historical_et_date)
+        return self.replay_started_utc + (_utc_now() - self.replay_wall_started_utc)
 
     def replay_market_is_open(self) -> bool:
         if not self.market_open:
@@ -325,7 +335,8 @@ class MockState:
             return True
         # Alpaca has no regular US equity session on weekends. Exchange holidays
         # are still delegated to upstream data availability.
-        return self.alpaca_historical_et_date.weekday() < 5
+        replay_et = self.replay_now_utc().astimezone(_NY)
+        return replay_et.weekday() < 5 and time_of_day(9, 30) <= replay_et.time() < time_of_day(16, 0)
 
     def next_quote(self, symbol: str) -> tuple[str, float, float]:
         """Synthetic quote: monotonic UTC ``t``, mid, half-spread width (bps-sized)."""
@@ -1098,7 +1109,7 @@ def main() -> None:
         default=_parse_hhmm(env_str("ALPACA_MOCK_ALPACA_TIME") or env_str("ALPACA_MOCK_TIME") or "09:30"),
         metavar="HH:MM",
         help=(
-            "Replay clock time in New York time when --alpaca-date is active. "
+            "Replay clock start time in New York time when --alpaca-date is active. "
             "Default: 09:30. Example: --alpaca-time 09:35."
         ),
     )
