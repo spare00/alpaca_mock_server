@@ -560,7 +560,8 @@ def _summary_data(path: str, code: int, body: Any, state: MockState) -> str:
     if path == "/v2/stocks/bars" and isinstance(body, dict):
         bars = body.get("bars") or {}
         parts: list[str] = []
-        for sym in sorted(bars.keys()):
+        symbols = sorted(bars.keys())
+        for sym in symbols[:8]:
             rows = bars[sym]
             if not rows:
                 parts.append(f"{sym}=0bars")
@@ -571,15 +572,20 @@ def _summary_data(path: str, code: int, body: Any, state: MockState) -> str:
                 if last.get("v") is not None
                 else f"{sym} n={len(rows)} last_t={last.get('t')} c={last.get('c')}"
             )
+        if len(symbols) > 8:
+            parts.append(f"... {len(symbols) - 8} more symbols")
         sm = f" sim_session_minutes_after_tick={state.sim_session_minutes:.4f}"
         return "; ".join(parts) + sm
     if path == "/v2/stocks/quotes/latest" and isinstance(body, dict):
         q = body.get("quotes") or {}
         parts = []
-        for sym in sorted(q.keys()):
+        symbols = sorted(q.keys())
+        for sym in symbols[:12]:
             row = q[sym]
             mid = (float(row.get("bp", 0)) + float(row.get("ap", 0))) / 2.0
             parts.append(f"{sym} t={row.get('t')} mid≈{mid:.4f} bp={row.get('bp')} ap={row.get('ap')}")
+        if len(symbols) > 12:
+            parts.append(f"... {len(symbols) - 12} more symbols")
         return "; ".join(parts)
     if isinstance(body, dict):
         return f"keys={list(body.keys())[:10]}"
