@@ -76,6 +76,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from historical_proxy import (
+    flatten_passthrough_params,
     proxy_quotes_latest,
     proxy_stock_bars,
     replay_session_minutes,
@@ -99,6 +100,7 @@ _MAIN_TRADING_GET_PATHS = frozenset(
 _MAIN_TRADING_ORDER_UUID = re.compile(r"^/v2/orders/([0-9a-f-]{36})$", re.I)
 _MAIN_DATA_PATHS = frozenset({"/v2/stocks/bars", "/v2/stocks/quotes/latest"})
 _TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
+_PASSTHROUGH_HEADER = "X-Alpaca-Mock-Replay"
 
 
 def _utc_now() -> datetime:
@@ -243,6 +245,10 @@ def _trading_get_assets(state: MockState, qs: dict[str, list[str]]) -> tuple[int
             return 200, body if body is not None else []
         return status, body if body is not None else {"message": err or "upstream assets error"}
     return 200, _synthetic_active_us_equity_assets(flat)
+
+
+def _wants_passthrough(headers: Any) -> bool:
+    return str(headers.get(_PASSTHROUGH_HEADER, "")).strip().lower() == "passthrough"
 
 
 class MockState:
@@ -815,6 +821,23 @@ class DataHandler(BaseHTTPRequestHandler):
 
         if path == "/v2/stocks/bars":
             if (
+                _wants_passthrough(self.headers)
+                and self.state.upstream_api_key
+                and self.state.upstream_secret_key
+            ):
+                params = flatten_passthrough_params(qs)
+                code, body, err = upstream_get_json(
+                    self.state.upstream_data_url,
+                    "/v2/stocks/bars",
+                    params,
+                    self.state.upstream_api_key,
+                    self.state.upstream_secret_key,
+                )
+                if body is None:
+                    body = {"message": err or "upstream passthrough error"}
+                self._send(code, body if isinstance(body, dict) else {"message": str(body)})
+                return
+            if (
                 self.state.alpaca_historical_et_date is not None
                 and self.state.upstream_api_key
                 and self.state.upstream_secret_key
@@ -841,6 +864,23 @@ class DataHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v2/stocks/quotes/latest":
+            if (
+                _wants_passthrough(self.headers)
+                and self.state.upstream_api_key
+                and self.state.upstream_secret_key
+            ):
+                params = flatten_passthrough_params(qs)
+                code, body, err = upstream_get_json(
+                    self.state.upstream_data_url,
+                    "/v2/stocks/quotes/latest",
+                    params,
+                    self.state.upstream_api_key,
+                    self.state.upstream_secret_key,
+                )
+                if body is None:
+                    body = {"message": err or "upstream passthrough error"}
+                self._send(code, body if isinstance(body, dict) else {"message": str(body)})
+                return
             if (
                 self.state.alpaca_historical_et_date is not None
                 and self.state.upstream_api_key

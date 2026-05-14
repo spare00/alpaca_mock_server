@@ -6,12 +6,12 @@ Used when ``mock_server`` is started with ``--alpaca-date`` so stocktrader can
 point ``ALPACA_DATA_BASE_URL`` at the mock and still receive historical SIP/IEX
 bars and quotes from Alpaca for that session date.
 
-For **daily (or wider) bar windows** with both ``start`` and ``end`` set, the
-client often spans many calendar days (for example ``select_market_universe``).
-In that case we **preserve the UTC span** and slide the window so the **end**
-lands on the replay ``target`` date (same US/Eastern clock time as the
-client’s ``end``), instead of snapping both endpoints onto ``target`` (which
-would collapse the range).
+For **start** and **end** on ``GET /v2/stocks/bars``, infer the client's implied
+last US/Eastern **session** calendar day from ``end`` (exclusive midnight at the
+start of the next day → through the prior calendar day). Slide ``start`` and
+``end`` by ``(replay target - implied)`` days so the mock forwards the same
+relative window to Alpaca as if the client had anchored on ``target`` instead
+of wall-clock "today" (no ``--as-of-date`` required on stocktrader).
 """
 from __future__ import annotations
 
@@ -89,6 +89,20 @@ def _et_close_utc(d: date) -> datetime:
     return datetime.combine(d, time_of_day(16, 0), tzinfo=_NY).astimezone(timezone.utc)
 
 
+def _implied_last_session_date_et(end_utc: datetime) -> date:
+    """
+    Calendar day in US/Eastern treated as the last session covered by ``end``.
+
+    If ``end`` is exactly midnight ET, treat it as an *exclusive* upper bound at
+    the start of that calendar day (typical daily-bar ``select_market_universe``
+    pattern), so the last session day is the prior calendar date.
+    """
+    et = end_utc.astimezone(_NY)
+    if et.time() == time_of_day(0, 0, 0, 0):
+        return et.date() - timedelta(days=1)
+    return et.date()
+
+
 def _replay_quote_window(snapped_end: datetime, target: date) -> tuple[datetime, datetime]:
     """
     Build a valid [start, end) window on ``target`` for historical quote fetches.
@@ -113,28 +127,6 @@ def _replay_quote_window(snapped_end: datetime, target: date) -> tuple[datetime,
 
 def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> dict[str, str]:
     """Build query dict for Alpaca ``GET /v2/stocks/bars`` from the mock client's query string."""
-    if _first(parsed_qs, "page_token"):
-        out: dict[str, str] = {}
-        for key in (
-            "symbols",
-            "timeframe",
-            "feed",
-            "limit",
-            "adjustment",
-            "asof",
-            "currency",
-            "page_token",
-            "sort",
-            "start",
-            "end",
-        ):
-            v = _first(parsed_qs, key)
-            if v is not None:
-                out[key] = v
-        if "feed" not in out:
-            out["feed"] = "iex"
-        return out
-
     out = {}
     for key in ("symbols", "timeframe", "feed", "limit", "adjustment", "asof", "currency", "page_token", "sort"):
         v = _first(parsed_qs, key)
@@ -150,27 +142,15 @@ def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> d
     step = timeframe_to_seconds(tf)
     now_utc = _utc_now()
 
-    long_daily_window = False
-    if start_s and end_s and step >= 86400:
-        su_raw = parse_iso_utc(start_s)
-        eu_raw = parse_iso_utc(end_s)
-        if su_raw and eu_raw and eu_raw > su_raw and (eu_raw - su_raw) >= timedelta(hours=24):
-            span = eu_raw - su_raw
-            eu_et = eu_raw.astimezone(_NY)
-            if eu_et.time() == time_of_day(0, 0, 0, 0):
-                # Typical daily history: exclusive end is midnight at the start of the *next* calendar
-                # day (see ``select_market_universe``). Align that boundary to the day after replay
-                # ``target`` so the window lands on real historical dates for that session.
-                new_end_et = datetime.combine(target + timedelta(days=1), time_of_day.min, tzinfo=_NY)
-            else:
-                new_end_et = datetime.combine(target, eu_et.time(), tzinfo=_NY)
-            new_end = new_end_et.astimezone(timezone.utc)
-            new_start = new_end - span
-            out["start"] = _iso_z(new_start)
-            out["end"] = _iso_z(new_end)
-            long_daily_window = True
+    su_full = parse_iso_utc(start_s) if start_s else None
+    eu_full = parse_iso_utc(end_s) if end_s else None
 
-    if not long_daily_window:
+    if su_full and eu_full and eu_full > su_full:
+        implied = _implied_last_session_date_et(eu_full)
+        shift_days = (target - implied).days
+        out["start"] = _iso_z(su_full + timedelta(days=shift_days))
+        out["end"] = _iso_z(eu_full + timedelta(days=shift_days))
+    else:
         if start_s:
             su = parse_iso_utc(start_s)
             if su:
@@ -204,6 +184,19 @@ def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> d
         if s_dt and e_dt and s_dt > e_dt:
             out["start"], out["end"] = out["end"], out["start"]
 
+    return out
+
+
+def flatten_passthrough_params(parsed_qs: dict[str, list[str]]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for key, vals in parsed_qs.items():
+        if not vals:
+            continue
+        first = vals[0]
+        if first is not None and first != "":
+            out[key] = first
+    if "feed" not in out:
+        out["feed"] = "iex"
     return out
 
 
@@ -263,32 +256,15 @@ def proxy_stock_bars(
     return status, body
 
 
-def _latest_quote_row_for_symbol(
-    symbol: str,
-    end_snap: datetime,
-    target: date,
-    feed: str,
-    base_url: str,
-    api_key: str,
-    secret_key: str,
-) -> dict[str, Any] | None:
-    start_win, eff_end = _replay_quote_window(end_snap, target)
-    params = {
-        "symbols": symbol,
-        "start": _iso_z(start_win),
-        "end": _iso_z(eff_end),
-        "limit": "200",
-        "sort": "desc",
-        "feed": feed,
-    }
-    status, body, _ = upstream_get_json(base_url, "/v2/stocks/quotes", params, api_key, secret_key)
-    if status != 200 or not isinstance(body, dict):
-        return None
-    quotes = body.get("quotes") or {}
-    rows = quotes.get(symbol) or quotes.get(symbol.upper()) or []
-    if not rows:
-        return None
-    return rows[0] if isinstance(rows[0], dict) else None
+def _rows_for_symbol(quotes: dict[str, Any], sym: str) -> list[Any]:
+    raw = quotes.get(sym)
+    if isinstance(raw, list) and raw:
+        return raw
+    sup = sym.upper()
+    for key, val in quotes.items():
+        if str(key).upper() == sup and isinstance(val, list):
+            return val
+    return []
 
 
 def proxy_quotes_latest(
@@ -304,11 +280,34 @@ def proxy_quotes_latest(
         return 400, {"message": "missing symbols"}
     feed = _first(parsed_qs, "feed") or "iex"
     end_snap = snap_datetime_to_target_et_date(_utc_now(), target)
+    start_win, eff_end = _replay_quote_window(end_snap, target)
     out: dict[str, dict[str, Any]] = {}
-    for sym in symbols:
-        row = _latest_quote_row_for_symbol(sym, end_snap, target, feed, base_url, api_key, secret_key)
-        if row:
-            out[sym] = row
+    # One upstream round-trip per chunk (not per symbol); otherwise universe-scale
+    # clients issue tens of thousands of sequential requests and appear hung.
+    chunk_size = 50
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i : i + chunk_size]
+        params = {
+            "symbols": ",".join(chunk),
+            "start": _iso_z(start_win),
+            "end": _iso_z(eff_end),
+            "limit": "10000",
+            "sort": "desc",
+            "feed": feed,
+        }
+        status, body, _ = upstream_get_json(
+            base_url, "/v2/stocks/quotes", params, api_key, secret_key, timeout=90.0
+        )
+        if status != 200 or not isinstance(body, dict):
+            continue
+        quotes = body.get("quotes") or {}
+        for sym in chunk:
+            rows = _rows_for_symbol(quotes, sym)
+            if not rows:
+                continue
+            row0 = rows[0] if isinstance(rows[0], dict) else None
+            if row0:
+                out[sym] = row0
     # Partial or empty is valid: clients (e.g. select_market_universe) treat missing
     # symbols as no quote rather than failing the whole batch.
     return 200, {"quotes": out}
