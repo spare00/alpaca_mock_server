@@ -125,7 +125,11 @@ def _replay_quote_window(snapped_end: datetime, target: date) -> tuple[datetime,
     return start_win, eff_end
 
 
-def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> dict[str, str]:
+def _flatten_upstream_params(
+    parsed_qs: dict[str, list[str]],
+    target: date,
+    replay_now_utc: datetime | None = None,
+) -> dict[str, str]:
     """Build query dict for Alpaca ``GET /v2/stocks/bars`` from the mock client's query string."""
     out = {}
     for key in ("symbols", "timeframe", "feed", "limit", "adjustment", "asof", "currency", "page_token", "sort"):
@@ -141,15 +145,21 @@ def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> d
     tf = out.get("timeframe") or "1Min"
     step = timeframe_to_seconds(tf)
     now_utc = _utc_now()
+    replay_now_utc = replay_now_utc or snap_datetime_to_target_et_date(now_utc, target)
 
     su_full = parse_iso_utc(start_s) if start_s else None
     eu_full = parse_iso_utc(end_s) if end_s else None
 
     if su_full and eu_full and eu_full > su_full:
-        implied = _implied_last_session_date_et(eu_full)
-        shift_days = (target - implied).days
-        out["start"] = _iso_z(su_full + timedelta(days=shift_days))
-        out["end"] = _iso_z(eu_full + timedelta(days=shift_days))
+        if timeframe_to_seconds(tf) < 86400:
+            span = eu_full - su_full
+            out["start"] = _iso_z(replay_now_utc - span)
+            out["end"] = _iso_z(replay_now_utc)
+        else:
+            implied = _implied_last_session_date_et(eu_full)
+            shift_days = (target - implied).days
+            out["start"] = _iso_z(su_full + timedelta(days=shift_days))
+            out["end"] = _iso_z(eu_full + timedelta(days=shift_days))
     else:
         if start_s:
             su = parse_iso_utc(start_s)
@@ -169,7 +179,7 @@ def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> d
         out["start"] = _iso_z(end_dt - timedelta(seconds=step * 100))
 
     if "start" not in out and "end" not in out:
-        end_snap = snap_datetime_to_target_et_date(now_utc, target)
+        end_snap = replay_now_utc
         if limit_s and limit_s.isdigit():
             lim = max(1, min(int(limit_s), 10_000))
             start_snap = end_snap - timedelta(seconds=step * lim)
@@ -246,8 +256,9 @@ def proxy_stock_bars(
     base_url: str,
     api_key: str,
     secret_key: str,
+    replay_now_utc: datetime | None = None,
 ) -> tuple[int, Any]:
-    params = _flatten_upstream_params(parsed_qs, target)
+    params = _flatten_upstream_params(parsed_qs, target, replay_now_utc)
     if not params.get("symbols"):
         return 400, {"message": "missing symbols"}
     status, body, err = upstream_get_json(base_url, "/v2/stocks/bars", params, api_key, secret_key)
@@ -273,13 +284,14 @@ def proxy_quotes_latest(
     base_url: str,
     api_key: str,
     secret_key: str,
+    replay_now_utc: datetime | None = None,
 ) -> tuple[int, Any]:
     symbols_raw = (_first(parsed_qs, "symbols") or "").split(",")
     symbols = [s.strip().upper() for s in symbols_raw if s.strip()]
     if not symbols:
         return 400, {"message": "missing symbols"}
     feed = _first(parsed_qs, "feed") or "iex"
-    end_snap = snap_datetime_to_target_et_date(_utc_now(), target)
+    end_snap = replay_now_utc or snap_datetime_to_target_et_date(_utc_now(), target)
     start_win, eff_end = _replay_quote_window(end_snap, target)
     out: dict[str, dict[str, Any]] = {}
     # One upstream round-trip per chunk (not per symbol); otherwise universe-scale

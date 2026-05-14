@@ -32,8 +32,9 @@ Stream mode still uses Alpaca WebSockets for live bars/quotes; this mock does
 not implement WS.
 
 **Alpaca historical replay:** pass ``--alpaca-date YYYY-MM-DD`` (and upstream API
-keys in ``.env`` or flags). Data routes proxy to Alpaca’s Data API with request
-times snapped onto that US/Eastern calendar day. Trading routes stay local.
+keys in ``.env`` or flags). Data routes proxy to Alpaca’s Data API with runtime
+request times shifted onto that US/Eastern calendar day and replay clock time
+(``--alpaca-time HH:MM``, default ``09:30``). Trading routes stay local.
 
 Run (local synthetic data)::
 
@@ -55,7 +56,7 @@ supported keys (``ALPACA_MOCK_*``, ``ALPACA_UPSTREAM_*``, etc.).
 
 Run (Alpaca-backed replay; keys typically in ``.env``)::
 
-    python mock_server.py --alpaca-date 2024-05-01 --access-log
+    python mock_server.py --alpaca-date 2024-05-01 --alpaca-time 09:35 --access-log
 """
 from __future__ import annotations
 
@@ -68,12 +69,13 @@ import sys
 import threading
 import uuid
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as time_of_day, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 from historical_proxy import (
     flatten_passthrough_params,
@@ -92,6 +94,7 @@ from mock_env import (
 )
 
 log = logging.getLogger("alpaca_mock")
+_NY = ZoneInfo("America/New_York")
 
 # Paths reachable from stocktrader main.py (see module docstring).
 _MAIN_TRADING_GET_PATHS = frozenset(
@@ -126,6 +129,21 @@ def _parse_iso(s: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _parse_hhmm(value: str | None) -> time_of_day | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        parts = raw.split(":")
+        if len(parts) != 2:
+            raise ValueError
+        hour = int(parts[0])
+        minute = int(parts[1])
+        return time_of_day(hour, minute)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be HH:MM in 24-hour New York time") from exc
 
 
 def _decimal_value(value: Any, default: str = "0") -> Decimal:
@@ -258,6 +276,7 @@ class MockState:
         market_open: bool,
         *,
         alpaca_historical_et_date: date | None = None,
+        alpaca_historical_et_time: time_of_day | None = None,
         upstream_data_url: str = "https://data.alpaca.markets",
         upstream_trading_url: str = "https://paper-api.alpaca.markets",
         upstream_api_key: str | None = None,
@@ -268,13 +287,16 @@ class MockState:
         self.market_open = market_open
         self.orders: dict[str, dict[str, Any]] = {}
         self.positions: dict[str, dict[str, Decimal]] = {}
-        self.account_lock = threading.Lock()
+        self.account_lock = threading.RLock()
         self.mock_prices: dict[str, float] = defaultdict(lambda: 100.0)
+        self.latest_market_prices: dict[str, Decimal] = {}
+        self.latest_market_price_times: dict[str, str] = {}
         self.sim_session_minutes: float = 0.0
         self.quote_tick_index: int = 0
         self.quote_lock = threading.Lock()
         self.quote_last_emit_utc: datetime | None = None
         self.alpaca_historical_et_date = alpaca_historical_et_date
+        self.alpaca_historical_et_time = alpaca_historical_et_time
         self.upstream_data_url = (upstream_data_url or "https://data.alpaca.markets").rstrip("/")
         self.upstream_trading_url = (upstream_trading_url or "https://paper-api.alpaca.markets").rstrip("/")
         self.upstream_api_key = upstream_api_key
@@ -283,7 +305,27 @@ class MockState:
     def refresh_replay_clock_from_wall(self) -> None:
         if self.alpaca_historical_et_date is None:
             return
-        self.sim_session_minutes = replay_session_minutes(self.alpaca_historical_et_date)
+        self.sim_session_minutes = replay_session_minutes(self.alpaca_historical_et_date, self.replay_now_utc())
+
+    def replay_now_utc(self) -> datetime:
+        if self.alpaca_historical_et_date is None:
+            return _utc_now()
+        if self.alpaca_historical_et_time is not None:
+            return datetime.combine(
+                self.alpaca_historical_et_date,
+                self.alpaca_historical_et_time,
+                tzinfo=_NY,
+            ).astimezone(timezone.utc)
+        return snap_datetime_to_target_et_date(_utc_now(), self.alpaca_historical_et_date)
+
+    def replay_market_is_open(self) -> bool:
+        if not self.market_open:
+            return False
+        if self.alpaca_historical_et_date is None:
+            return True
+        # Alpaca has no regular US equity session on weekends. Exchange holidays
+        # are still delegated to upstream data availability.
+        return self.alpaca_historical_et_date.weekday() < 5
 
     def next_quote(self, symbol: str) -> tuple[str, float, float]:
         """Synthetic quote: monotonic UTC ``t``, mid, half-spread width (bps-sized)."""
@@ -310,8 +352,62 @@ class MockState:
         spread = max(0.01, price * spread_bps)
         return _iso(dt), float(price), float(spread)
 
+    def remember_market_price(self, symbol: str, price: Any, timestamp: Any = None) -> None:
+        sym = str(symbol or "").upper()
+        px = _decimal_value(price, "0")
+        if not sym or px <= 0:
+            return
+        with self.account_lock:
+            self.latest_market_prices[sym] = px
+            if timestamp:
+                self.latest_market_price_times[sym] = str(timestamp)
+
+    def has_market_price(self, symbol: str) -> bool:
+        sym = str(symbol or "").upper()
+        with self.account_lock:
+            px = self.latest_market_prices.get(sym)
+        return px is not None and px > 0
+
+    def remember_market_data(self, body: Any) -> None:
+        if not isinstance(body, dict):
+            return
+        quotes = body.get("quotes")
+        if isinstance(quotes, dict):
+            for sym, row in quotes.items():
+                if not isinstance(row, dict):
+                    continue
+                bid = _decimal_value(row.get("bp"), "0")
+                ask = _decimal_value(row.get("ap"), "0")
+                if bid > 0 and ask > 0:
+                    self.remember_market_price(sym, (bid + ask) / Decimal("2"), row.get("t"))
+                elif ask > 0:
+                    self.remember_market_price(sym, ask, row.get("t"))
+                elif bid > 0:
+                    self.remember_market_price(sym, bid, row.get("t"))
+        bars = body.get("bars")
+        if isinstance(bars, dict):
+            for sym, rows in bars.items():
+                if not isinstance(rows, list):
+                    continue
+                latest: dict[str, Any] | None = None
+                latest_dt: datetime | None = None
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    row_dt = _parse_iso(str(row.get("t") or ""))
+                    if latest is None or (row_dt is not None and (latest_dt is None or row_dt >= latest_dt)):
+                        latest = row
+                        latest_dt = row_dt
+                if latest:
+                    self.remember_market_price(sym, latest.get("c"), latest.get("t"))
+
     def mid_price(self, symbol: str, _at: datetime) -> float:
-        return float(self.mock_prices[symbol.upper()])
+        sym = symbol.upper()
+        with self.account_lock:
+            px = self.latest_market_prices.get(sym)
+        if px is not None and px > 0:
+            return float(px)
+        return float(self.mock_prices[sym])
 
     def account_payload(self) -> dict[str, Any]:
         with self.account_lock:
@@ -652,14 +748,14 @@ class TradingHandler(BaseHTTPRequestHandler):
         if path == "/v2/clock":
             self.state.refresh_replay_clock_from_wall()
             if self.state.alpaca_historical_et_date is not None:
-                now = snap_datetime_to_target_et_date(_utc_now(), self.state.alpaca_historical_et_date)
+                now = self.state.replay_now_utc()
             else:
                 now = _utc_now()
             self._send(
                 200,
                 {
                     "timestamp": _iso(now),
-                    "is_open": self.state.market_open,
+                    "is_open": self.state.replay_market_is_open(),
                     "next_open": _iso(now - timedelta(hours=1)),
                     "next_close": _iso(now + timedelta(hours=6)),
                 },
@@ -718,12 +814,38 @@ class TradingHandler(BaseHTTPRequestHandler):
             self._send(400, {"code": 40010001, "message": "invalid json"})
             return
 
-        now = _utc_now()
+        now = self.state.replay_now_utc()
         oid = str(uuid.uuid4()).lower()
         sym = (body.get("symbol") or "").upper()
+        if (
+            sym
+            and not self.state.has_market_price(sym)
+            and self.state.alpaca_historical_et_date is not None
+            and self.state.upstream_api_key
+            and self.state.upstream_secret_key
+        ):
+            code, quote_body = proxy_quotes_latest(
+                {"symbols": [sym]},
+                self.state.alpaca_historical_et_date,
+                self.state.upstream_data_url,
+                self.state.upstream_api_key,
+                self.state.upstream_secret_key,
+                now,
+            )
+            if code == 200:
+                self.state.remember_market_data(quote_body)
+        if self.state.alpaca_historical_et_date is not None and sym and not self.state.has_market_price(sym):
+            self._send(
+                422,
+                {
+                    "code": 42210000,
+                    "message": f"no replay market price available for {sym}; refusing synthetic fill",
+                },
+            )
+            return
         px = f"{self.state.mid_price(sym, now):.4f}"
 
-        if self.state.market_open and (body.get("type") or "market").lower() == "market":
+        if self.state.replay_market_is_open() and (body.get("type") or "market").lower() == "market":
             st = "filled"
             o = _order_payload(oid, body, st, None, px, now)
             self.state.apply_fill(o)
@@ -790,7 +912,7 @@ class DataHandler(BaseHTTPRequestHandler):
             st.refresh_replay_clock_from_wall()
             syn: str | None = None
             if st.alpaca_historical_et_date is not None:
-                syn = _iso(snap_datetime_to_target_et_date(_utc_now(), st.alpaca_historical_et_date))
+                syn = _iso(st.replay_now_utc())
             self._send(
                 200,
                 {
@@ -799,9 +921,12 @@ class DataHandler(BaseHTTPRequestHandler):
                     "alpaca_historical_et_date": str(st.alpaca_historical_et_date)
                     if st.alpaca_historical_et_date
                     else None,
+                    "alpaca_historical_et_time": st.alpaca_historical_et_time.strftime("%H:%M")
+                    if st.alpaca_historical_et_time
+                    else None,
                     "upstream_data_url": st.upstream_data_url if st.alpaca_historical_et_date else None,
                     "synthetic_timestamp_utc": syn,
-                    "market_open_flag": st.market_open,
+                    "market_open_flag": st.replay_market_is_open(),
                     "quote_tick_index": st.quote_tick_index,
                 },
             )
@@ -849,7 +974,10 @@ class DataHandler(BaseHTTPRequestHandler):
                     self.state.upstream_data_url,
                     self.state.upstream_api_key,
                     self.state.upstream_secret_key,
+                    self.state.replay_now_utc(),
                 )
+                if code == 200:
+                    self.state.remember_market_data(body)
                 self._send(code, body if isinstance(body, dict) else {"message": str(body)})
                 return
             symbols = (qs.get("symbols") or [""])[0].split(",")
@@ -893,7 +1021,10 @@ class DataHandler(BaseHTTPRequestHandler):
                     self.state.upstream_data_url,
                     self.state.upstream_api_key,
                     self.state.upstream_secret_key,
+                    self.state.replay_now_utc(),
                 )
+                if code == 200:
+                    self.state.remember_market_data(body)
                 self._send(code, body if isinstance(body, dict) else {"message": str(body)})
                 return
             symbols = (qs.get("symbols") or [""])[0].split(",")
@@ -962,6 +1093,16 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--alpaca-time",
+        type=_parse_hhmm,
+        default=_parse_hhmm(env_str("ALPACA_MOCK_ALPACA_TIME") or env_str("ALPACA_MOCK_TIME") or "09:30"),
+        metavar="HH:MM",
+        help=(
+            "Replay clock time in New York time when --alpaca-date is active. "
+            "Default: 09:30. Example: --alpaca-time 09:35."
+        ),
+    )
+    p.add_argument(
         "--upstream-trading-url",
         type=str,
         default=env_str("ALPACA_UPSTREAM_TRADING_URL", "https://paper-api.alpaca.markets")
@@ -1011,6 +1152,7 @@ def main() -> None:
         print(f"Loaded environment from {loaded_env_path}", flush=True)
 
     alpaca_hist: date | None = None
+    alpaca_hist_time: time_of_day | None = None
     if args.alpaca_date and str(args.alpaca_date).strip():
         key = str(args.upstream_api_key).strip()
         sec = str(args.upstream_secret_key).strip()
@@ -1024,11 +1166,13 @@ def main() -> None:
             alpaca_hist = date.fromisoformat(str(args.alpaca_date).strip())
         except ValueError:
             p.error("--alpaca-date must be YYYY-MM-DD")
+        alpaca_hist_time = args.alpaca_time or time_of_day(9, 30)
 
     state = MockState(
         args.cash,
         market_open=not args.market_closed,
         alpaca_historical_et_date=alpaca_hist,
+        alpaca_historical_et_time=alpaca_hist_time,
         upstream_data_url=args.upstream_data_url,
         upstream_trading_url=args.upstream_trading_url,
         upstream_api_key=str(args.upstream_api_key).strip() or None,
@@ -1064,8 +1208,12 @@ def main() -> None:
 
     alpaca_line = ""
     if alpaca_hist:
+        weekend_note = ""
+        if alpaca_hist.weekday() >= 5:
+            weekend_note = "  Warning: replay date is a weekend; upstream equity data will usually be empty.\n"
         alpaca_line = (
-            f"  Alpaca historical replay: ET date={alpaca_hist} | upstream data={args.upstream_data_url.rstrip('/')}\n"
+            f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} | upstream data={args.upstream_data_url.rstrip('/')}\n"
+            f"{weekend_note}"
         )
     print(
         f"Alpaca mock (main.py REST surface) listening:\n"
