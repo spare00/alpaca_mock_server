@@ -85,6 +85,32 @@ def _et_open_utc(d: date) -> datetime:
     return datetime.combine(d, time_of_day(9, 30), tzinfo=_NY).astimezone(timezone.utc)
 
 
+def _et_close_utc(d: date) -> datetime:
+    return datetime.combine(d, time_of_day(16, 0), tzinfo=_NY).astimezone(timezone.utc)
+
+
+def _replay_quote_window(snapped_end: datetime, target: date) -> tuple[datetime, datetime]:
+    """
+    Build a valid [start, end) window on ``target`` for historical quote fetches.
+
+    Wall-clock snaps before the cash open can make ``snapped_end`` fall before
+    09:30 ET, which previously produced start > end and empty upstream results
+    for every symbol (502 on /v2/stocks/quotes/latest replay).
+    """
+    open_u = _et_open_utc(target)
+    close_u = _et_close_utc(target)
+    eff_end = snapped_end
+    if eff_end <= open_u:
+        eff_end = close_u
+    elif eff_end > close_u:
+        eff_end = close_u
+    start_win = max(open_u, eff_end - timedelta(hours=9))
+    if start_win >= eff_end:
+        start_win = open_u
+        eff_end = min(close_u, open_u + timedelta(hours=7, minutes=30))
+    return start_win, eff_end
+
+
 def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> dict[str, str]:
     """Build query dict for Alpaca ``GET /v2/stocks/bars`` from the mock client's query string."""
     if _first(parsed_qs, "page_token"):
@@ -246,11 +272,11 @@ def _latest_quote_row_for_symbol(
     api_key: str,
     secret_key: str,
 ) -> dict[str, Any] | None:
-    start_win = max(_et_open_utc(target), end_snap - timedelta(hours=8))
+    start_win, eff_end = _replay_quote_window(end_snap, target)
     params = {
         "symbols": symbol,
         "start": _iso_z(start_win),
-        "end": _iso_z(end_snap),
+        "end": _iso_z(eff_end),
         "limit": "200",
         "sort": "desc",
         "feed": feed,
@@ -283,8 +309,8 @@ def proxy_quotes_latest(
         row = _latest_quote_row_for_symbol(sym, end_snap, target, feed, base_url, api_key, secret_key)
         if row:
             out[sym] = row
-    if not out:
-        return 502, {"message": "no quotes returned from upstream for requested symbols in replay window"}
+    # Partial or empty is valid: clients (e.g. select_market_universe) treat missing
+    # symbols as no quote rather than failing the whole batch.
     return 200, {"quotes": out}
 
 
