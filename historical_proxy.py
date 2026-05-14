@@ -5,6 +5,13 @@ request timestamps onto a replay calendar day (America/New_York).
 Used when ``mock_server`` is started with ``--alpaca-date`` so stocktrader can
 point ``ALPACA_DATA_BASE_URL`` at the mock and still receive historical SIP/IEX
 bars and quotes from Alpaca for that session date.
+
+For **daily (or wider) bar windows** with both ``start`` and ``end`` set, the
+client often spans many calendar days (for example ``select_market_universe``).
+In that case we **preserve the UTC span** and slide the window so the **end**
+lands on the replay ``target`` date (same US/Eastern clock time as the
+client’s ``end``), instead of snapping both endpoints onto ``target`` (which
+would collapse the range).
 """
 from __future__ import annotations
 
@@ -117,14 +124,35 @@ def _flatten_upstream_params(parsed_qs: dict[str, list[str]], target: date) -> d
     step = timeframe_to_seconds(tf)
     now_utc = _utc_now()
 
-    if start_s:
-        su = parse_iso_utc(start_s)
-        if su:
-            out["start"] = _iso_z(snap_datetime_to_target_et_date(su, target))
-    if end_s:
-        eu = parse_iso_utc(end_s)
-        if eu:
-            out["end"] = _iso_z(snap_datetime_to_target_et_date(eu, target))
+    long_daily_window = False
+    if start_s and end_s and step >= 86400:
+        su_raw = parse_iso_utc(start_s)
+        eu_raw = parse_iso_utc(end_s)
+        if su_raw and eu_raw and eu_raw > su_raw and (eu_raw - su_raw) >= timedelta(hours=24):
+            span = eu_raw - su_raw
+            eu_et = eu_raw.astimezone(_NY)
+            if eu_et.time() == time_of_day(0, 0, 0, 0):
+                # Typical daily history: exclusive end is midnight at the start of the *next* calendar
+                # day (see ``select_market_universe``). Align that boundary to the day after replay
+                # ``target`` so the window lands on real historical dates for that session.
+                new_end_et = datetime.combine(target + timedelta(days=1), time_of_day.min, tzinfo=_NY)
+            else:
+                new_end_et = datetime.combine(target, eu_et.time(), tzinfo=_NY)
+            new_end = new_end_et.astimezone(timezone.utc)
+            new_start = new_end - span
+            out["start"] = _iso_z(new_start)
+            out["end"] = _iso_z(new_end)
+            long_daily_window = True
+
+    if not long_daily_window:
+        if start_s:
+            su = parse_iso_utc(start_s)
+            if su:
+                out["start"] = _iso_z(snap_datetime_to_target_et_date(su, target))
+        if end_s:
+            eu = parse_iso_utc(end_s)
+            if eu:
+                out["end"] = _iso_z(snap_datetime_to_target_et_date(eu, target))
 
     if "start" in out and "end" not in out:
         end_src = parse_iso_utc(end_s) if end_s else now_utc
