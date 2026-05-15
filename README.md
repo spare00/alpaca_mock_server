@@ -38,9 +38,13 @@ Other flags/env vars are **not** used to fake market prices in normal replay, bu
 
 ## Run
 
+For **historical replay**, the important flags are **`--alpaca-date`** (which US/Eastern calendar day to replay) and **`--alpaca-time`** (where the replay clock starts on that day; default `09:30` if omitted). Upstream Alpaca credentials must be set (`ALPACA_UPSTREAM_API_KEY` / `ALPACA_UPSTREAM_SECRET_KEY` in `.env` or the matching CLI flags).
+
 ```bash
+# Replay May 13, 2024 from 9:35am ET (most common: set date + time, rest from .env)
+python mock_server.py --alpaca-date 2024-05-13 --alpaca-time 09:35 --access-log
+
 python mock_server.py --access-log
-python mock_server.py --alpaca-date 2024-05-13 --access-log
 python mock_server.py --price INTC=35.5 --access-log
 ```
 
