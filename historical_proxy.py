@@ -125,6 +125,19 @@ def _replay_quote_window(snapped_end: datetime, target: date) -> tuple[datetime,
     return start_win, eff_end
 
 
+def _effective_bar_window_limit(limit_s: str | None) -> int:
+    """How many bars to span when inferring a missing ``start`` or ``end`` (Alpaca ``limit`` semantics).
+
+    Real Alpaca honors ``limit`` with ``end`` (and no ``start``); the mock must not cap this at a
+    small constant or indicator warmups (e.g. MACD default 120 bars on 1Min) fail under replay.
+    """
+    if limit_s and limit_s.isdigit():
+        return max(1, min(int(limit_s), 10_000))
+    # When the client omits ``limit``, use a generous default similar to Alpaca's typical cap
+    # so inferred windows are wide enough for downstream strategies without changing their params.
+    return 1000
+
+
 def _flatten_upstream_params(
     parsed_qs: dict[str, list[str]],
     target: date,
@@ -176,12 +189,13 @@ def _flatten_upstream_params(
 
     if "end" in out and "start" not in out:
         end_dt = parse_iso_utc(out["end"]) or snap_datetime_to_target_et_date(now_utc, target)
-        out["start"] = _iso_z(end_dt - timedelta(seconds=step * 100))
+        lim = _effective_bar_window_limit(limit_s)
+        out["start"] = _iso_z(end_dt - timedelta(seconds=step * lim))
 
     if "start" not in out and "end" not in out:
         end_snap = replay_now_utc
         if limit_s and limit_s.isdigit():
-            lim = max(1, min(int(limit_s), 10_000))
+            lim = _effective_bar_window_limit(limit_s)
             start_snap = end_snap - timedelta(seconds=step * lim)
         else:
             start_snap = end_snap - timedelta(minutes=15)
