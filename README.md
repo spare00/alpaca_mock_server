@@ -13,7 +13,7 @@ See **`env.example`** for supported variable names (`ALPACA_MOCK_*`, `ALPACA_UPS
 ## Modes
 
 **Alpaca historical replay (`--alpaca-date` or `ALPACA_MOCK_ALPACA_DATE` in `.env`)**  
-The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. By default the replay clock starts at `09:30` New York time and advances with server runtime; override the start time with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2024-05-13 --alpaca-time 09:35`). Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock). For `quotes/latest`, historical upstream data can omit a symbol or return unusable bid/ask; the mock then fills that symbol with a tight synthetic NBBO from the **last known mid** (from upstream bars/quotes once seen, else optional `--price` / default `100`), so REST clients always receive a valid quote row per requested ticker.
+The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. By default the replay clock starts at `09:30` New York time and advances with server runtime; override the start time with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2026-05-13 --alpaca-time 09:35`). Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock). For `quotes/latest`, historical upstream data can omit a symbol or return unusable bid/ask; the mock then fills that symbol with a tight synthetic NBBO from the **last known mid** (from upstream bars/quotes once seen, else optional `--price` / default `100`), so REST clients always receive a valid quote row per requested ticker.
 
 For **bars**, requests that send `end` and `limit` without `start` are mapped upstream using the same **limit-sized** window as live Alpaca (not a fixed small bar count), so clients like stocktrader do not need different warmup parameters under replay.
 
@@ -41,8 +41,8 @@ Other flags/env vars are **not** used to fake market prices in normal replay, bu
 For **historical replay**, the important flags are **`--alpaca-date`** (which US/Eastern calendar day to replay) and **`--alpaca-time`** (where the replay clock starts on that day; default `09:30` if omitted). Upstream Alpaca credentials must be set (`ALPACA_UPSTREAM_API_KEY` / `ALPACA_UPSTREAM_SECRET_KEY` in `.env` or the matching CLI flags).
 
 ```bash
-# Replay May 13, 2024 from 9:35am ET (most common: set date + time, rest from .env)
-python mock_server.py --alpaca-date 2024-05-13 --alpaca-time 09:35 --access-log
+# Replay May 13, 2026 from 9:35am ET (most common: set date + time, rest from .env)
+python mock_server.py --alpaca-date 2026-05-13 --alpaca-time 09:35 --access-log
 
 python mock_server.py --access-log
 python mock_server.py --price INTC=35.5 --access-log
