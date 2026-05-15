@@ -297,6 +297,8 @@ class MockState:
         self.account_lock = threading.RLock()
         self.mock_prices: dict[str, float] = defaultdict(lambda: 100.0)
         self.latest_market_prices: dict[str, Decimal] = {}
+        self.latest_market_bids: dict[str, Decimal] = {}
+        self.latest_market_asks: dict[str, Decimal] = {}
         self.latest_market_price_times: dict[str, str] = {}
         self.sim_session_minutes: float = 0.0
         self.quote_tick_index: int = 0
@@ -394,6 +396,7 @@ class MockState:
         price = base_price * (1.0 + drift + noise)
         spread_bps = 0.0003 + (tick % 8) * 0.0001
         spread = max(0.01, price * spread_bps)
+        self.remember_market_quote(sym, price - spread / 2, price + spread / 2, _iso(dt))
         return _iso(dt), float(price), float(spread)
 
     def remember_market_price(self, symbol: str, price: Any, timestamp: Any = None) -> None:
@@ -403,6 +406,28 @@ class MockState:
             return
         with self.account_lock:
             self.latest_market_prices[sym] = px
+            if timestamp:
+                self.latest_market_price_times[sym] = str(timestamp)
+
+    def remember_market_quote(self, symbol: str, bid: Any, ask: Any, timestamp: Any = None) -> None:
+        sym = str(symbol or "").upper()
+        bp = _decimal_value(bid, "0")
+        ap = _decimal_value(ask, "0")
+        if not sym:
+            return
+        with self.account_lock:
+            if bp > 0:
+                self.latest_market_bids[sym] = bp
+            if ap > 0:
+                self.latest_market_asks[sym] = ap
+            if bp > 0 and ap > 0:
+                self.latest_market_prices[sym] = (bp + ap) / Decimal("2")
+            elif ap > 0:
+                self.latest_market_prices[sym] = ap
+            elif bp > 0:
+                self.latest_market_prices[sym] = bp
+            else:
+                return
             if timestamp:
                 self.latest_market_price_times[sym] = str(timestamp)
 
@@ -423,11 +448,11 @@ class MockState:
                 bid = _decimal_value(row.get("bp"), "0")
                 ask = _decimal_value(row.get("ap"), "0")
                 if bid > 0 and ask > 0:
-                    self.remember_market_price(sym, (bid + ask) / Decimal("2"), row.get("t"))
+                    self.remember_market_quote(sym, bid, ask, row.get("t"))
                 elif ask > 0:
-                    self.remember_market_price(sym, ask, row.get("t"))
+                    self.remember_market_quote(sym, 0, ask, row.get("t"))
                 elif bid > 0:
-                    self.remember_market_price(sym, bid, row.get("t"))
+                    self.remember_market_quote(sym, bid, 0, row.get("t"))
         bars = body.get("bars")
         if isinstance(bars, dict):
             for sym, rows in bars.items():
@@ -452,6 +477,20 @@ class MockState:
         if px is not None and px > 0:
             return float(px)
         return float(self.mock_prices[sym])
+
+    def fill_price(self, symbol: str, side: str, at: datetime) -> float:
+        sym = symbol.upper()
+        side_norm = str(side or "").lower()
+        with self.account_lock:
+            if side_norm == "buy":
+                px = self.latest_market_asks.get(sym)
+            elif side_norm == "sell":
+                px = self.latest_market_bids.get(sym)
+            else:
+                px = None
+        if px is not None and px > 0:
+            return float(px)
+        return self.mid_price(sym, at)
 
     def account_payload(self) -> dict[str, Any]:
         with self.account_lock:
@@ -910,7 +949,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
     }
   }
 
-  function closestLabelIndex(eventT, utcTimes) {
+  function closestTimeIndex(eventT, utcTimes) {
     const et = parseIsoMs(eventT);
     if (et === null || !utcTimes.length) return 0;
     let best = 0;
@@ -924,12 +963,6 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
     return best;
   }
 
-  function chartLabelForEvent(evT, utcTimes, labels) {
-    let idx = utcTimes.indexOf(evT);
-    if (idx < 0) idx = closestLabelIndex(evT, utcTimes);
-    return labels[idx] || labels[0] || "";
-  }
-
   function buildChartData(barsBySym, symList, tradeEvents) {
     const syms = (symList && symList.length) ? symList : Object.keys(barsBySym || {}).sort();
     const timeSet = new Set();
@@ -941,18 +974,18 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       });
     });
     const utcTimes = Array.from(timeSet).sort();
-    const labels = utcTimes.map(formatEt);
     const colors = ["#5ac8fa", "#ff9500", "#34c759", "#ff375f", "#bf5af2", "#ffd60a"];
     const datasets = [];
     syms.forEach(function (sym, i) {
       const rows = barsBySym[sym] || [];
-      const m = {};
-      rows.forEach(function (r) { m[r.t] = r.c; });
-      const data = utcTimes.map(function (t) { return m[t] !== undefined ? m[t] : null; });
+      const data = rows.map(function (r) {
+        return { x: parseIsoMs(r.t), y: r.c, _t: r.t };
+      }).filter(function (p) { return p.x !== null && p.y !== undefined && p.y !== null; });
       datasets.push({
         type: "line",
         label: sym,
         data: data,
+        parsing: { xAxisKey: "x", yAxisKey: "y" },
         borderColor: colors[i % colors.length],
         backgroundColor: "transparent",
         spanGaps: true,
@@ -966,8 +999,10 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       evs.forEach(function (ev) {
         if ((ev.symbol || "").toUpperCase() !== sym.toUpperCase()) return;
         const side = (ev.side || "buy").toLowerCase();
+        const xMs = parseIsoMs(ev.t);
+        if (xMs === null) return;
         fillPoints.push({
-          x: chartLabelForEvent(ev.t, utcTimes, labels),
+          x: xMs,
           y: ev.price,
           _side: side,
           _t: ev.t,
@@ -994,7 +1029,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
         });
       }
     });
-    return { labels: labels, datasets: datasets, utcTimes: utcTimes };
+    return { datasets: datasets, utcTimes: utcTimes };
   }
 
   function renderSymbolStrip(strip, j) {
@@ -1048,7 +1083,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       responsive: true,
       maintainAspectRatio: true,
       animation: false,
-      interaction: { mode: "index", intersect: false },
+      interaction: { mode: "nearest", intersect: false },
       plugins: {
         legend: {
           labels: {
@@ -1060,6 +1095,13 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
         },
         tooltip: {
           callbacks: {
+            title: function (items) {
+              if (!items || !items.length) return "";
+              const raw = items[0].raw || {};
+              if (raw._t) return formatEt(raw._t);
+              const x = items[0].parsed && items[0].parsed.x;
+              return x != null ? formatEt(new Date(x).toISOString()) : "";
+            },
             label: function (ctx) {
               const raw = ctx.raw;
               if (raw && raw._side) {
@@ -1073,12 +1115,13 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
               if (ctx.dataset.type === "scatter") return "";
               const ch = ctx.chart;
               const ds = ctx.dataset;
-              const i = ctx.dataIndex;
               const utcBars = ch._barUtcTimes || [];
               const sym = ds.label || "";
+              const raw = ctx.raw || {};
+              const i = raw._t ? closestTimeIndex(raw._t, utcBars) : 0;
               const hits = (jLast && jLast.trade_events) ? jLast.trade_events.filter(function (ev) {
                 return (ev.symbol || "").toUpperCase() === sym.toUpperCase() &&
-                  closestLabelIndex(ev.t, utcBars) === i;
+                  closestTimeIndex(ev.t, utcBars) === i;
               }) : [];
               if (!hits.length) return "";
               return hits.map(function (h) {
@@ -1090,7 +1133,15 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       },
       scales: {
         x: {
-          ticks: { color: "#aaa", maxRotation: 45, minRotation: 0, autoSkip: true, maxTicksLimit: 24 },
+          type: "linear",
+          ticks: {
+            color: "#aaa",
+            maxRotation: 45,
+            minRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 24,
+            callback: function (value) { return formatEt(new Date(value).toISOString()); }
+          },
           grid: { color: "rgba(255,255,255,0.06)" },
           title: { display: true, text: "Bar time (US/Eastern)", color: "#888" }
         },
@@ -1151,7 +1202,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       renderSymbolStrip(strip, j);
       const bars = j.bars || {};
       const cd = buildChartData(bars, symList, j.trade_events || []);
-      chart.data.labels = cd.labels;
+      chart.data.labels = [];
       chart.data.datasets = cd.datasets;
       chart._barUtcTimes = cd.utcTimes;
       chart.update("none");
@@ -1477,7 +1528,7 @@ class TradingHandler(BaseHTTPRequestHandler):
                 },
             )
             return
-        px = f"{self.state.mid_price(sym, now):.4f}"
+        px = f"{self.state.fill_price(sym, (body.get('side') or 'buy').lower(), now):.4f}"
 
         if self.state.replay_market_is_open() and (body.get("type") or "market").lower() == "market":
             st = "filled"
