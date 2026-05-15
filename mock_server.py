@@ -924,6 +924,12 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
     return best;
   }
 
+  function chartLabelForEvent(evT, utcTimes, labels) {
+    let idx = utcTimes.indexOf(evT);
+    if (idx < 0) idx = closestLabelIndex(evT, utcTimes);
+    return labels[idx] || labels[0] || "";
+  }
+
   function buildChartData(barsBySym, symList, tradeEvents) {
     const syms = (symList && symList.length) ? symList : Object.keys(barsBySym || {}).sort();
     const timeSet = new Set();
@@ -959,11 +965,9 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       const fillPoints = [];
       evs.forEach(function (ev) {
         if ((ev.symbol || "").toUpperCase() !== sym.toUpperCase()) return;
-        const idx = utcTimes.indexOf(ev.t);
-        const useIdx = idx >= 0 ? idx : closestLabelIndex(ev.t, utcTimes);
         const side = (ev.side || "buy").toLowerCase();
         fillPoints.push({
-          x: useIdx,
+          x: chartLabelForEvent(ev.t, utcTimes, labels),
           y: ev.price,
           _side: side,
           _t: ev.t,
@@ -975,6 +979,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
           type: "scatter",
           label: sym + " fills",
           data: fillPoints,
+          parsing: { xAxisKey: "x", yAxisKey: "y" },
           pointRadius: 11,
           pointHoverRadius: 13,
           pointBorderWidth: 1,
@@ -1045,7 +1050,14 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       animation: false,
       interaction: { mode: "index", intersect: false },
       plugins: {
-        legend: { labels: { color: "#ccc" } },
+        legend: {
+          labels: {
+            color: "#ccc",
+            filter: function (item) {
+              return item.text && item.text.indexOf(" fills") < 0;
+            }
+          }
+        },
         tooltip: {
           callbacks: {
             label: function (ctx) {
