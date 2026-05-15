@@ -138,6 +138,53 @@ def _effective_bar_window_limit(limit_s: str | None) -> int:
     return 1000
 
 
+def _previous_weekday(d: date) -> date:
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= timedelta(days=1)
+    return prev
+
+
+def _is_session_backfill_window(start_utc: datetime, end_utc: datetime, timeframe: str) -> bool:
+    if timeframe_to_seconds(timeframe) >= 86400:
+        return False
+    start_et = start_utc.astimezone(_NY)
+    end_et = end_utc.astimezone(_NY)
+    if start_et.date() != end_et.date():
+        return False
+    if end_utc - start_utc < timedelta(hours=6):
+        return False
+    return start_et.time() <= time_of_day(4, 30) and end_et.time() >= time_of_day(15, 30)
+
+
+def _session_backfill_params(
+    start_utc: datetime,
+    end_utc: datetime,
+    target: date,
+    replay_now_utc: datetime,
+) -> tuple[str, str]:
+    """
+    Map stocktrader's broad intraday preload request to a no-lookahead warmup window.
+
+    The REST poller asks for short explicit windows like [now-3m, now], which should
+    follow the replay clock. Indicator preload asks for a whole session, typically
+    [04:00, 16:00]. During early replay that full-session request should not be
+    rewritten to "12 hours ending at 09:35" because most of that range is overnight
+    and the strategy never gets enough prior bars to warm MACD. Instead, end at the
+    current replay time and include the previous weekday session as context.
+    """
+    snapped_start = snap_datetime_to_target_et_date(start_utc, target)
+    snapped_end = snap_datetime_to_target_et_date(end_utc, target)
+    end_dt = min(snapped_end, replay_now_utc)
+    previous = _previous_weekday(target)
+    requested_start_time = start_utc.astimezone(_NY).time()
+    previous_start = datetime.combine(previous, requested_start_time, tzinfo=_NY).astimezone(timezone.utc)
+    start_dt = min(snapped_start, previous_start)
+    if end_dt <= start_dt:
+        end_dt = replay_now_utc
+    return _iso_z(start_dt), _iso_z(end_dt)
+
+
 def _flatten_upstream_params(
     parsed_qs: dict[str, list[str]],
     target: date,
@@ -165,9 +212,12 @@ def _flatten_upstream_params(
 
     if su_full and eu_full and eu_full > su_full:
         if timeframe_to_seconds(tf) < 86400:
-            span = eu_full - su_full
-            out["start"] = _iso_z(replay_now_utc - span)
-            out["end"] = _iso_z(replay_now_utc)
+            if _is_session_backfill_window(su_full, eu_full, tf):
+                out["start"], out["end"] = _session_backfill_params(su_full, eu_full, target, replay_now_utc)
+            else:
+                span = eu_full - su_full
+                out["start"] = _iso_z(replay_now_utc - span)
+                out["end"] = _iso_z(replay_now_utc)
         else:
             implied = _implied_last_session_date_et(eu_full)
             shift_days = (target - implied).days
