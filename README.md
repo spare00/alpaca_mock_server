@@ -50,7 +50,8 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 
 - `GET /v2/stocks/quotes/latest`
 - `GET /v2/stocks/bars` (when `ALPACA_MARKET_DATA_MODE=rest`)
+- `GET /chart` — browser chart polling `GET /v1/mock/chart-series`. Chips pick **one** symbol to chart at a time (defaults to the first tracked / URL-listed ticker). Buy/sell **fills** show as markers (`trade_events` in JSON). Example: `http://127.0.0.1:19902/chart?minutes=60&timeframe=1Min`
 
-Diagnostics: `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `data_mode` (`local_synthetic` or `alpaca_replay`), `sim_session_minutes` (meaningful in replay mode), `market_open_flag`, `quote_tick_index`, and replay fields when applicable.
+Diagnostics: `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `data_mode` (`local_synthetic` or `alpaca_replay`), `sim_session_minutes` (meaningful in replay mode), `market_open_flag`, `quote_tick_index`, `tracked_symbol_count` / `tracked_symbols_sample` (tickers seen from stocktrader-style requests), and replay fields when applicable.
 
 Requires Python 3.9+ (stdlib only for the server; `--alpaca-date` uses `urllib` to call Alpaca’s HTTPS data API).

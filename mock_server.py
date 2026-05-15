@@ -27,6 +27,9 @@ REST against this mock:
 - ``GET /v2/stocks/bars`` — ``AlpacaRestPollingStream`` when
   ``ALPACA_MARKET_DATA_MODE=rest``; without ``--alpaca-date``, simple synthetic OHLC
   from the same mock mids.
+- ``GET /chart`` — browser line chart (Chart.js from a CDN) that polls
+  ``GET /v1/mock/chart-series``. Symbol chips switch which single ticker is charted;
+  buy/sell fill markers come from mock order fills.
 
 Stream mode still uses Alpaca WebSockets for live bars/quotes; this mock does
 not implement WS.
@@ -74,7 +77,7 @@ from datetime import date, datetime, time as time_of_day, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
@@ -105,6 +108,9 @@ _MAIN_TRADING_ORDER_UUID = re.compile(r"^/v2/orders/([0-9a-f-]{36})$", re.I)
 _MAIN_DATA_PATHS = frozenset({"/v2/stocks/bars", "/v2/stocks/quotes/latest"})
 _TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 _PASSTHROUGH_HEADER = "X-Alpaca-Mock-Replay"
+# Cap chart-series when using auto-detected symbols (many series + large bar payloads).
+_MAX_CHART_TRACKED_SYMBOLS = 100
+_MAX_TRADE_EVENTS = 5000
 
 
 def _utc_now() -> datetime:
@@ -304,6 +310,33 @@ class MockState:
         self.upstream_trading_url = (upstream_trading_url or "https://paper-api.alpaca.markets").rstrip("/")
         self.upstream_api_key = upstream_api_key
         self.upstream_secret_key = upstream_secret_key
+        self._tracked_symbols_lock = threading.Lock()
+        self.tracked_symbols: set[str] = set()
+        self._trade_events_lock = threading.Lock()
+        self.trade_events: list[dict[str, Any]] = []
+
+    def record_tracked_symbols(self, symbols: Iterable[str]) -> None:
+        """Remember tickers seen on data or trading routes (for /chart auto-symbols)."""
+        syms = [str(s).strip().upper() for s in symbols if s is not None and str(s).strip()]
+        if not syms:
+            return
+        with self._tracked_symbols_lock:
+            self.tracked_symbols.update(syms)
+
+    def _record_trade_fill(self, order: dict[str, Any], sym: str, side: str, price: float) -> None:
+        sd = side if side in ("buy", "sell") else "buy"
+        t_ev = str(order.get("filled_at") or order.get("updated_at") or _iso(_utc_now()))
+        ev: dict[str, Any] = {
+            "t": t_ev,
+            "symbol": sym.upper(),
+            "side": sd,
+            "price": price,
+            "order_id": str(order.get("id") or ""),
+        }
+        with self._trade_events_lock:
+            self.trade_events.append(ev)
+            if len(self.trade_events) > _MAX_TRADE_EVENTS:
+                self.trade_events = self.trade_events[-_MAX_TRADE_EVENTS:]
 
     def _initial_replay_utc(self) -> datetime | None:
         if self.alpaca_historical_et_date is None:
@@ -491,7 +524,10 @@ class MockState:
         if qty <= 0 or px <= 0:
             return
         side = str(order.get("side") or "buy").lower()
+        if side not in ("buy", "sell"):
+            side = "buy"
         signed_qty = qty if side == "buy" else -qty
+        self._record_trade_fill(order, sym, side, float(px))
         with self.account_lock:
             self.cash -= signed_qty * px
             pos = self.positions.get(sym)
@@ -568,6 +604,446 @@ def _synthetic_bars(
         if limit and len(out[sym]) > limit:
             out[sym] = out[sym][-limit:]
     return out
+
+
+def _split_symbol_csv(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [s.strip().upper() for s in str(raw).split(",") if s.strip()]
+
+
+def _chart_symbols_from_qs(qs: dict[str, list[str]]) -> list[str]:
+    return _split_symbol_csv((qs.get("symbols") or [""])[0])
+
+
+def _chart_minutes_timeframe(qs: dict[str, list[str]]) -> tuple[int, str]:
+    minutes_raw = (qs.get("minutes") or ["120"])[0]
+    try:
+        minutes = int(minutes_raw)
+    except (TypeError, ValueError):
+        minutes = 120
+    minutes = max(5, min(minutes, 24 * 60))
+    timeframe = (qs.get("timeframe") or ["1Min"])[0] or "1Min"
+    return minutes, timeframe
+
+
+def _chart_resolve_symbol_list(state: MockState, qs: dict[str, list[str]]) -> tuple[list[str], str, dict[str, Any]]:
+    """Pick chart tickers: explicit ``symbols=`` query, else tickers seen from stocktrader, else defaults."""
+    extra: dict[str, Any] = {}
+    explicit = _chart_symbols_from_qs(qs)
+    if explicit:
+        return explicit, "query", extra
+    with state._tracked_symbols_lock:
+        tracked_all = sorted(state.tracked_symbols)
+    if tracked_all:
+        extra["tracked_symbol_count"] = len(tracked_all)
+        if len(tracked_all) > _MAX_CHART_TRACKED_SYMBOLS:
+            extra["chart_symbols_capped"] = True
+            return tracked_all[:_MAX_CHART_TRACKED_SYMBOLS], "tracked", extra
+        return tracked_all, "tracked", extra
+    return ["AAPL", "MSFT"], "default", extra
+
+
+def _trade_events_for_chart_window(
+    state: MockState, symbols: list[str], start: datetime, end: datetime
+) -> list[dict[str, Any]]:
+    """Fills in ``[start, end]`` for symbols on the chart (replay or wall-clock timestamps)."""
+    symset = {s.upper() for s in symbols}
+    with state._trade_events_lock:
+        snap = list(state.trade_events)
+    out: list[dict[str, Any]] = []
+    for ev in snap:
+        sym = str(ev.get("symbol") or "").upper()
+        if sym not in symset:
+            continue
+        dt = _parse_iso(str(ev.get("t") or ""))
+        if dt is None:
+            continue
+        if dt < start or dt > end:
+            continue
+        sd = str(ev.get("side") or "buy").lower()
+        if sd not in ("buy", "sell"):
+            sd = "buy"
+        try:
+            price = float(ev.get("price"))
+        except (TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "t": str(ev.get("t") or ""),
+                "symbol": sym,
+                "side": sd,
+                "price": price,
+                "order_id": str(ev.get("order_id") or ""),
+            }
+        )
+    out.sort(key=lambda e: e["t"])
+    return out
+
+
+def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
+    """Bars for the chart UI: same upstream/synthetic rules as ``GET /v2/stocks/bars``."""
+    minutes, timeframe = _chart_minutes_timeframe(qs)
+    symbols, symbol_source, symbol_extra = _chart_resolve_symbol_list(state, qs)
+    with state._tracked_symbols_lock:
+        strip_full = sorted(state.tracked_symbols)
+    if not strip_full:
+        strip_full = ["AAPL", "MSFT"]
+    chart_strip = strip_full[:_MAX_CHART_TRACKED_SYMBOLS]
+    strip_meta: dict[str, Any] = {"chart_symbol_strip": chart_strip}
+    if len(strip_full) > _MAX_CHART_TRACKED_SYMBOLS:
+        strip_meta["chart_symbol_strip_total"] = len(strip_full)
+    state.refresh_replay_clock_from_wall()
+    end = state.replay_now_utc()
+    start = end - timedelta(minutes=minutes)
+    bar_qs: dict[str, list[str]] = {
+        "symbols": [",".join(symbols)],
+        "timeframe": [timeframe],
+        "feed": ["iex"],
+        "start": [_iso(start)],
+        "end": [_iso(end)],
+        "limit": ["2000"],
+    }
+    data_mode = "alpaca_replay" if state.alpaca_historical_et_date else "local_synthetic"
+    meta: dict[str, Any] = {
+        "replay_now_utc": _iso(end),
+        "data_mode": data_mode,
+        "minutes": minutes,
+        "timeframe": timeframe,
+        "symbols": symbols,
+        "symbol_source": symbol_source,
+        "trade_events": _trade_events_for_chart_window(state, symbols, start, end),
+        **strip_meta,
+        **symbol_extra,
+    }
+    if (
+        state.alpaca_historical_et_date is not None
+        and state.upstream_api_key
+        and state.upstream_secret_key
+    ):
+        code, body = proxy_stock_bars(
+            bar_qs,
+            state.alpaca_historical_et_date,
+            state.upstream_data_url,
+            state.upstream_api_key,
+            state.upstream_secret_key,
+            state.replay_now_utc(),
+        )
+        if isinstance(body, dict):
+            out = dict(meta)
+            out.update(body)
+            if code == 200:
+                state.remember_market_data(body)
+            return code, out
+        return code, {**meta, "message": str(body)}
+    bars = _synthetic_bars(symbols, timeframe, start, end, 2000, state)
+    return 200, {**meta, "bars": bars, "next_page_token": None}
+
+
+_CHART_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Alpaca mock — live bars</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; background: #111; color: #e8e8e8; }
+  #meta { font-size: 13px; opacity: 0.85; margin-bottom: 12px; }
+  #err { color: #ff6b6b; margin-bottom: 8px; min-height: 1.2em; }
+  #symbol-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  #symbol-strip button { cursor: pointer; padding: 6px 12px; border-radius: 8px; border: 1px solid #444;
+    background: #222; color: #eee; font-size: 13px; }
+  #symbol-strip button.on { background: #2a4a6a; border-color: #5ac8fa; }
+  #symbol-strip .hint { font-size: 12px; opacity: 0.75; margin-left: 4px; }
+  canvas { max-height: 68vh; }
+  a { color: #7ecbff; }
+</style>
+</head>
+<body>
+  <h1>Mock data — bar chart</h1>
+  <p>Tickers come from what the mock has seen (bars, quotes, orders). Use the chips to switch the chart to one symbol at a time.
+    Green ▲ = buy fill, red ▼ = sell fill (snapped to nearest bar). Optional URL: <code>?symbols=AAPL,MSFT</code> (first is shown until you pick another chip),
+    <code>minutes</code>, <code>timeframe</code>, <code>poll</code> (default 5s, min 5s, max 120s).</p>
+  <div id="symbol-strip"></div>
+  <div id="meta"></div>
+  <div id="err"></div>
+  <canvas id="c"></canvas>
+  <p><a href="/v1/mock/status">/v1/mock/status</a></p>
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const rawSym = params.get("symbols");
+  const symbolsOverride = rawSym
+    ? rawSym.split(",").map(function (s) { return s.trim().toUpperCase(); }).filter(Boolean)
+    : [];
+  const minutes = params.get("minutes") || "120";
+  const timeframe = params.get("timeframe") || "1Min";
+  let pollMs = parseInt(params.get("poll") || "5000", 10);
+  if (!isFinite(pollMs)) pollMs = 5000;
+  pollMs = Math.max(5000, Math.min(pollMs, 120000));
+
+  const urlLocked = symbolsOverride.length > 0;
+  let activeSymbol = null;
+  const stripEl = document.getElementById("symbol-strip");
+
+  function getStripList(j) {
+    if (urlLocked) return symbolsOverride.slice();
+    const a = j.chart_symbol_strip;
+    if (a && a.length) return a.slice();
+    return (j.symbols || []).slice();
+  }
+
+  function parseIsoMs(s) {
+    const ms = Date.parse(s);
+    return isNaN(ms) ? null : ms;
+  }
+
+  function formatEt(isoUtc) {
+    if (!isoUtc) return "";
+    try {
+      const d = new Date(isoUtc);
+      if (isNaN(d.getTime())) return String(isoUtc);
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/New_York",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true,
+        timeZoneName: "short"
+      }).format(d);
+    } catch (e) {
+      return String(isoUtc);
+    }
+  }
+
+  function closestLabelIndex(eventT, utcTimes) {
+    const et = parseIsoMs(eventT);
+    if (et === null || !utcTimes.length) return 0;
+    let best = 0;
+    let bestDiff = Infinity;
+    for (let i = 0; i < utcTimes.length; i++) {
+      const bt = parseIsoMs(utcTimes[i]);
+      if (bt === null) continue;
+      const d = Math.abs(bt - et);
+      if (d < bestDiff) { bestDiff = d; best = i; }
+    }
+    return best;
+  }
+
+  function buildChartData(barsBySym, symList, tradeEvents) {
+    const syms = (symList && symList.length) ? symList : Object.keys(barsBySym || {}).sort();
+    const timeSet = new Set();
+    syms.forEach(function (sym) {
+      (barsBySym[sym] || []).forEach(function (row) { timeSet.add(row.t); });
+    });
+    const utcTimes = Array.from(timeSet).sort();
+    const labels = utcTimes.map(formatEt);
+    const colors = ["#5ac8fa", "#ff9500", "#34c759", "#ff375f", "#bf5af2", "#ffd60a"];
+    const evs = tradeEvents || [];
+    const datasets = [];
+    syms.forEach(function (sym, i) {
+      const rows = barsBySym[sym] || [];
+      const m = {};
+      rows.forEach(function (r) { m[r.t] = r.c; });
+      const data = utcTimes.map(function (t) { return m[t] !== undefined ? m[t] : null; });
+      const n = utcTimes.length;
+      const buy = new Array(n).fill(false);
+      const sell = new Array(n).fill(false);
+      evs.forEach(function (ev) {
+        if ((ev.symbol || "").toUpperCase() !== sym) return;
+        const idx = closestLabelIndex(ev.t, utcTimes);
+        if ((ev.side || "").toLowerCase() === "sell") sell[idx] = true;
+        else buy[idx] = true;
+      });
+      const pointRadius = utcTimes.map(function (_, j) {
+        return (buy[j] || sell[j]) ? 9 : 0;
+      });
+      const pointBackgroundColor = utcTimes.map(function (_, j) {
+        if (buy[j] && sell[j]) return "#ffd60a";
+        if (buy[j]) return "#34c759";
+        if (sell[j]) return "#ff375f";
+        return colors[i % colors.length];
+      });
+      const pointStyle = utcTimes.map(function (_, j) {
+        if (buy[j] && sell[j]) return "star";
+        if (sell[j]) return "triangle";
+        return "triangle";
+      });
+      const pointRotation = utcTimes.map(function (_, j) {
+        if (sell[j] && !buy[j]) return 180;
+        return 0;
+      });
+      datasets.push({
+        label: sym,
+        data: data,
+        borderColor: colors[i % colors.length],
+        backgroundColor: "transparent",
+        spanGaps: true,
+        tension: 0.12,
+        pointRadius: pointRadius,
+        pointHoverRadius: 11,
+        pointBorderWidth: 1,
+        pointBorderColor: "#111",
+        pointStyle: pointStyle,
+        pointRotation: pointRotation,
+        pointBackgroundColor: pointBackgroundColor,
+        borderWidth: 1.5
+      });
+    });
+    return { labels: labels, datasets: datasets, utcTimes: utcTimes };
+  }
+
+  function renderSymbolStrip(strip, j) {
+    stripEl.innerHTML = "";
+    if (!strip.length) {
+      const sp = document.createElement("span");
+      sp.className = "hint";
+      sp.textContent = "No symbols yet — run stocktrader against the mock or open with ?symbols=TICKER";
+      stripEl.appendChild(sp);
+      return;
+    }
+    strip.forEach(function (s) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = s;
+      if (activeSymbol === s) b.classList.add("on");
+      b.onclick = function () {
+        activeSymbol = s;
+        tick();
+      };
+      stripEl.appendChild(b);
+    });
+    if (urlLocked) {
+      const h = document.createElement("span");
+      h.className = "hint";
+      h.textContent = "(URL fixed symbol list; chip picks which one to chart)";
+      stripEl.appendChild(h);
+    }
+    const tot = j && j.chart_symbol_strip_total;
+    if (tot && tot > strip.length) {
+      const sp = document.createElement("span");
+      sp.className = "hint";
+      sp.textContent = "showing " + strip.length + " of " + tot + " tracked";
+      stripEl.appendChild(sp);
+    }
+  }
+
+  const ctx = document.getElementById("c").getContext("2d");
+  let chart = new Chart(ctx, {
+    type: "line",
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { labels: { color: "#ccc" } },
+        tooltip: {
+          callbacks: {
+            afterLabel: function (ctx) {
+              const ch = ctx.chart;
+              const ds = ctx.dataset;
+              const i = ctx.dataIndex;
+              if (!ds.pointRadius || typeof ds.pointRadius === "number") return "";
+              const r = ds.pointRadius[i];
+              if (!r) return "";
+              const utcBars = ch._barUtcTimes || [];
+              const sym = ds.label || "";
+              const hits = (jLast && jLast.trade_events) ? jLast.trade_events.filter(function (ev) {
+                return (ev.symbol || "").toUpperCase() === sym.toUpperCase() &&
+                  closestLabelIndex(ev.t, utcBars) === i;
+              }) : [];
+              if (!hits.length) return "";
+              return hits.map(function (h) {
+                return (h.side || "") + " " + (h.price != null ? h.price : "") + " @ " + formatEt(h.t || "");
+              }).join("\\n");
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: "#aaa", maxRotation: 45, minRotation: 0, autoSkip: true, maxTicksLimit: 24 },
+          grid: { color: "rgba(255,255,255,0.06)" },
+          title: { display: true, text: "Bar time (US/Eastern)", color: "#888" }
+        },
+        y: {
+          ticks: { color: "#aaa" },
+          grid: { color: "rgba(255,255,255,0.06)" },
+          title: { display: true, text: "Close", color: "#888" }
+        }
+      }
+    }
+  });
+
+  let jLast = null;
+
+  async function tick() {
+    const u = new URL("/v1/mock/chart-series", location.origin);
+    if (urlLocked) {
+      if (!activeSymbol && symbolsOverride.length) activeSymbol = symbolsOverride[0];
+      if (activeSymbol) u.searchParams.set("symbols", activeSymbol);
+    } else if (activeSymbol) {
+      u.searchParams.set("symbols", activeSymbol);
+    }
+    u.searchParams.set("minutes", minutes);
+    u.searchParams.set("timeframe", timeframe);
+    const errEl = document.getElementById("err");
+    try {
+      const r = await fetch(u.toString(), { cache: "no-store" });
+      const j = await r.json();
+      if (!r.ok) {
+        errEl.textContent = (j && j.message) ? j.message : ("HTTP " + r.status);
+        return;
+      }
+      const strip = getStripList(j);
+      if (!activeSymbol && strip.length) {
+        activeSymbol = strip[0];
+        return tick();
+      }
+      if (activeSymbol && strip.length && strip.indexOf(activeSymbol) === -1) {
+        activeSymbol = strip[0];
+        return tick();
+      }
+      jLast = j;
+      errEl.textContent = "";
+      const meta = document.getElementById("meta");
+      const symList = j.symbols || Object.keys(j.bars || {}).sort();
+      let capNote = "";
+      if (j.chart_symbols_capped) capNote = " (capped, tracked=" + (j.tracked_symbol_count || "") + ")";
+      const nTr = (j.trade_events && j.trade_events.length) ? j.trade_events.length : 0;
+      meta.textContent =
+        (j.data_mode || "") + "  source=" + (j.symbol_source || "") + capNote +
+        "  replay_now (US/Eastern)=" + formatEt(j.replay_now_utc || "") +
+        "  showing=" + (activeSymbol || "") +
+        "  series=" + symList.length + "  fills_in_window=" + nTr +
+        "  bars: " + symList.map(function (s) {
+          var a = (j.bars && j.bars[s]) ? j.bars[s].length : 0;
+          return s + "=" + a;
+        }).join(" ");
+      renderSymbolStrip(strip, j);
+      const bars = j.bars || {};
+      const cd = buildChartData(bars, symList, j.trade_events || []);
+      chart.data.labels = cd.labels;
+      chart.data.datasets = cd.datasets;
+      chart._barUtcTimes = cd.utcTimes;
+      chart.update("none");
+    } catch (e) {
+      errEl.textContent = String(e);
+    }
+  }
+
+  tick();
+  setInterval(tick, pollMs);
+})();
+</script>
+</body>
+</html>
+"""
 
 
 def _order_payload(
@@ -668,7 +1144,19 @@ def _summary_data(path: str, code: int, body: Any, state: MockState) -> str:
     if path == "/v1/mock/status" and isinstance(body, dict):
         return (
             f"sim_session_minutes={body.get('sim_session_minutes')} "
-            f"synthetic_ts={body.get('synthetic_timestamp_utc')} mode={body.get('data_mode')}"
+            f"synthetic_ts={body.get('synthetic_timestamp_utc')} mode={body.get('data_mode')} "
+            f"tracked_n={body.get('tracked_symbol_count')}"
+        )
+    if path == "/chart":
+        return "html chart"
+    if path == "/v1/mock/chart-series" and isinstance(body, dict):
+        bars = body.get("bars") or {}
+        n = sum(len(v) for v in bars.values() if isinstance(v, list))
+        te = body.get("trade_events") or []
+        n_te = len(te) if isinstance(te, list) else 0
+        return (
+            f"src={body.get('symbol_source')} mode={body.get('data_mode')} replay={body.get('replay_now_utc')} "
+            f"syms={body.get('symbols')} total_bars={n} trades={n_te}"
         )
     if path == "/v2/stocks/bars" and isinstance(body, dict):
         bars = body.get("bars") or {}
@@ -778,16 +1266,23 @@ class TradingHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v2/positions":
+            with self.state.account_lock:
+                self.state.record_tracked_symbols(list(self.state.positions.keys()))
             self._send(200, self.state.position_payloads())
             return
 
         if path == "/v2/orders":
             status_filter = ((qs.get("status") or ["open"])[0] or "open").lower()
             out = []
+            order_syms: list[str] = []
             for o in self.state.orders.values():
+                s = str(o.get("symbol") or "").strip().upper()
+                if s:
+                    order_syms.append(s)
                 order_status = str(o.get("status") or "").lower()
                 if _order_matches_status_filter(order_status, status_filter):
                     out.append(o)
+            self.state.record_tracked_symbols(order_syms)
             self._send(200, out)
             return
 
@@ -798,6 +1293,9 @@ class TradingHandler(BaseHTTPRequestHandler):
             if not o:
                 self._send(404, {"code": 40410000, "message": "order not found"})
                 return
+            s = str(o.get("symbol") or "").strip().upper()
+            if s:
+                self.state.record_tracked_symbols([s])
             self._send(200, o)
             return
 
@@ -828,6 +1326,8 @@ class TradingHandler(BaseHTTPRequestHandler):
         now = self.state.replay_now_utc()
         oid = str(uuid.uuid4()).lower()
         sym = (body.get("symbol") or "").upper()
+        if sym:
+            self.state.record_tracked_symbols([sym])
         if (
             sym
             and not self.state.has_market_price(sym)
@@ -913,6 +1413,22 @@ class DataHandler(BaseHTTPRequestHandler):
                 _summary_data(urlparse(self.path).path, code, body, self.state),
             )
 
+    def _send_html(self, code: int, html: str) -> None:
+        data = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        if self.access_log:
+            _access_line(
+                "data",
+                self.command,
+                self.path,
+                code,
+                _summary_data(urlparse(self.path).path, code, {"_html": True}, self.state),
+            )
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -924,6 +1440,8 @@ class DataHandler(BaseHTTPRequestHandler):
             syn: str | None = None
             if st.alpaca_historical_et_date is not None:
                 syn = _iso(st.replay_now_utc())
+            with st._tracked_symbols_lock:
+                ts_sorted = sorted(st.tracked_symbols)
             self._send(
                 200,
                 {
@@ -939,8 +1457,19 @@ class DataHandler(BaseHTTPRequestHandler):
                     "synthetic_timestamp_utc": syn,
                     "market_open_flag": st.replay_market_is_open(),
                     "quote_tick_index": st.quote_tick_index,
+                    "tracked_symbol_count": len(ts_sorted),
+                    "tracked_symbols_sample": ts_sorted[:200],
                 },
             )
+            return
+
+        if path == "/chart":
+            self._send_html(200, _CHART_PAGE_HTML)
+            return
+
+        if path == "/v1/mock/chart-series":
+            code, body = _mock_chart_series(self.state, qs)
+            self._send(code, body if isinstance(body, dict) else {"message": str(body)})
             return
 
         if path not in _MAIN_DATA_PATHS:
@@ -948,14 +1477,15 @@ class DataHandler(BaseHTTPRequestHandler):
                 404,
                 {
                     "message": (
-                        f"unknown path {path}; this mock only implements main.py data GET "
-                        "/v2/stocks/bars (rest mode) and /v2/stocks/quotes/latest"
+                        f"unknown path {path}; data mock serves /v2/stocks/bars, "
+                        "/v2/stocks/quotes/latest, /chart, /v1/mock/chart-series, /v1/mock/status"
                     )
                 },
             )
             return
 
         if path == "/v2/stocks/bars":
+            self.state.record_tracked_symbols(_split_symbol_csv((qs.get("symbols") or [""])[0]))
             if (
                 _wants_passthrough(self.headers)
                 and self.state.upstream_api_key
@@ -1003,6 +1533,7 @@ class DataHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/v2/stocks/quotes/latest":
+            self.state.record_tracked_symbols(_split_symbol_csv((qs.get("symbols") or [""])[0]))
             if (
                 _wants_passthrough(self.headers)
                 and self.state.upstream_api_key
@@ -1233,7 +1764,7 @@ def main() -> None:
         f"           POST /v2/orders   DELETE /v2/orders/{{id}}\n"
         f"  Data:    http://{args.host}:{args.data_port}\n"
         f"           GET /v2/stocks/quotes/latest   GET /v2/stocks/bars (rest mode only)\n"
-        f"           GET /v1/mock/status (simulation snapshot; not Alpaca)\n"
+        f"           GET /chart  GET /v1/mock/chart-series  GET /v1/mock/status\n"
         f"{alpaca_line}"
         f"  Without --alpaca-date, bars/quotes are simple local synthetics from --price / defaults.\n"
         f"Set ALPACA_TRADING_BASE_URL and ALPACA_DATA_BASE_URL (EXECUTION_MODE / ALPACA_MARKET_DATA_MODE as needed).\n"
