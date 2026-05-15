@@ -612,6 +612,10 @@ def _split_symbol_csv(raw: str | None) -> list[str]:
     return [s.strip().upper() for s in str(raw).split(",") if s.strip()]
 
 
+def _chart_symbols_from_qs(qs: dict[str, list[str]]) -> list[str]:
+    return _split_symbol_csv((qs.get("symbols") or [""])[0])
+
+
 def _quote_bp_ap(row: Any) -> tuple[float, float]:
     """Best-effort bid/ask from Alpaca-style (``bp``/``ap``) or alternate keys."""
     if not isinstance(row, dict):
@@ -658,7 +662,6 @@ def _backfill_replay_latest_quotes(state: MockState, qs: dict[str, list[str]], b
             changed = True
     if changed:
         body["quotes"] = quotes
-    return _split_symbol_csv((qs.get("symbols") or [""])[0])
 
 
 def _chart_minutes_timeframe(qs: dict[str, list[str]]) -> tuple[int, str]:
