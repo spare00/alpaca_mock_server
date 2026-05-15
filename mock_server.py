@@ -1666,13 +1666,25 @@ def main() -> None:
         default=float(env_str("ALPACA_MOCK_CASH", "25000") or "25000"),
         metavar="USD",
         help=(
-            "Starting cash / buying_power for the local paper-trading mock (GET /v2/account). "
-            "Same role as a real Alpaca paper account balance. Default: 25000 unless overridden by "
-            "ALPACA_MOCK_CASH in the environment or .env."
+            "Starting cash / buying_power for the local paper-trading mock only (GET /v2/account); "
+            "does not change replayed market data. Default: 25000 or ALPACA_MOCK_CASH."
         ),
     )
-    p.add_argument("--market-closed", action="store_true", help="Report clock.is_open=false")
-    p.add_argument("--price", action="append", default=[], metavar="SYM=PRICE", help="Mock mid price (repeatable)")
+    p.add_argument(
+        "--market-closed",
+        action="store_true",
+        help="Force GET /v2/clock is_open=false (or set ALPACA_MOCK_MARKET_CLOSED). Optional session gate override.",
+    )
+    p.add_argument(
+        "--price",
+        action="append",
+        default=[],
+        metavar="SYM=PRICE",
+        help=(
+            "Static mid overrides for local synthetic mode (no --alpaca-date). "
+            "With --alpaca-date, optional fallback mid per symbol before upstream bars/quotes are seen."
+        ),
+    )
     p.add_argument(
         "--alpaca-date",
         type=str,
@@ -1815,9 +1827,13 @@ def main() -> None:
         f"           GET /v2/stocks/quotes/latest   GET /v2/stocks/bars (rest mode only)\n"
         f"           GET /chart  GET /v1/mock/chart-series  GET /v1/mock/status\n"
         f"{alpaca_line}"
-        f"  Without --alpaca-date, bars/quotes are simple local synthetics from --price / defaults.\n"
-        f"Set ALPACA_TRADING_BASE_URL and ALPACA_DATA_BASE_URL (EXECUTION_MODE / ALPACA_MARKET_DATA_MODE as needed).\n"
-        f"  Response logging: {'on (--access-log)' if access_log else 'off (add --access-log to log each reply)'}",
+        + (
+            "  Replay mode: bars/quotes come from upstream; --price / ALPACA_MOCK_PRICE optional fallback only.\n"
+            if alpaca_hist
+            else "  Without --alpaca-date, bars/quotes are local synthetics from --price / defaults.\n"
+        )
+        + f"Set ALPACA_TRADING_BASE_URL and ALPACA_DATA_BASE_URL (EXECUTION_MODE / ALPACA_MARKET_DATA_MODE as needed).\n"
+        + f"  Response logging: {'on (--access-log)' if access_log else 'off (add --access-log to log each reply)'}",
         flush=True,
     )
     try:
