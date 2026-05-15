@@ -692,6 +692,45 @@ def _chart_resolve_symbol_list(state: MockState, qs: dict[str, list[str]]) -> tu
     return ["AAPL", "MSFT"], "default", extra
 
 
+def _symbols_with_trades(state: MockState) -> list[str]:
+    with state._trade_events_lock:
+        syms = {str(ev.get("symbol") or "").upper() for ev in state.trade_events}
+    return sorted(s for s in syms if s)
+
+
+def _trade_counts_by_symbol(state: MockState) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    with state._trade_events_lock:
+        for ev in state.trade_events:
+            sym = str(ev.get("symbol") or "").upper()
+            if sym:
+                counts[sym] += 1
+    return dict(counts)
+
+
+def _chart_bounds_for_symbols(
+    state: MockState, symbols: list[str], minutes: int
+) -> tuple[datetime, datetime]:
+    """Bar window ending at replay now, widened to include any recorded fills for ``symbols``."""
+    state.refresh_replay_clock_from_wall()
+    end = state.replay_now_utc()
+    start = end - timedelta(minutes=minutes)
+    symset = {s.upper() for s in symbols}
+    with state._trade_events_lock:
+        for ev in state.trade_events:
+            sym = str(ev.get("symbol") or "").upper()
+            if sym not in symset:
+                continue
+            dt = _parse_iso(str(ev.get("t") or ""))
+            if dt is None:
+                continue
+            if dt < start:
+                start = dt - timedelta(minutes=1)
+            if dt > end:
+                end = dt + timedelta(minutes=1)
+    return start, end
+
+
 def _trade_events_for_chart_window(
     state: MockState, symbols: list[str], start: datetime, end: datetime
 ) -> list[dict[str, Any]]:
@@ -700,6 +739,7 @@ def _trade_events_for_chart_window(
     with state._trade_events_lock:
         snap = list(state.trade_events)
     out: list[dict[str, Any]] = []
+    pad = timedelta(seconds=1)
     for ev in snap:
         sym = str(ev.get("symbol") or "").upper()
         if sym not in symset:
@@ -707,7 +747,7 @@ def _trade_events_for_chart_window(
         dt = _parse_iso(str(ev.get("t") or ""))
         if dt is None:
             continue
-        if dt < start or dt > end:
+        if dt < start - pad or dt > end + pad:
             continue
         sd = str(ev.get("side") or "buy").lower()
         if sd not in ("buy", "sell"):
@@ -741,9 +781,7 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
     strip_meta: dict[str, Any] = {"chart_symbol_strip": chart_strip}
     if len(strip_full) > _MAX_CHART_TRACKED_SYMBOLS:
         strip_meta["chart_symbol_strip_total"] = len(strip_full)
-    state.refresh_replay_clock_from_wall()
-    end = state.replay_now_utc()
-    start = end - timedelta(minutes=minutes)
+    start, end = _chart_bounds_for_symbols(state, symbols, minutes)
     bar_qs: dict[str, list[str]] = {
         "symbols": [",".join(symbols)],
         "timeframe": [timeframe],
@@ -761,6 +799,8 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
         "symbols": symbols,
         "symbol_source": symbol_source,
         "trade_events": _trade_events_for_chart_window(state, symbols, start, end),
+        "symbols_with_trades": _symbols_with_trades(state),
+        "trade_counts_by_symbol": _trade_counts_by_symbol(state),
         **strip_meta,
         **symbol_extra,
     }
@@ -803,6 +843,8 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
   #symbol-strip button { cursor: pointer; padding: 6px 12px; border-radius: 8px; border: 1px solid #444;
     background: #222; color: #eee; font-size: 13px; }
   #symbol-strip button.on { background: #2a4a6a; border-color: #5ac8fa; }
+  #symbol-strip button.has-trades:not(.on) { background: #1a2e24; border-color: #34c759; color: #d8ffe8; }
+  #symbol-strip button.has-trades.on { border-color: #7dffb0; box-shadow: 0 0 0 1px #34c75966; }
   #symbol-strip .hint { font-size: 12px; opacity: 0.75; margin-left: 4px; }
   canvas { max-height: 68vh; }
   a { color: #7ecbff; }
@@ -811,7 +853,8 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
 <body>
   <h1>Mock data — bar chart</h1>
   <p>Tickers come from what the mock has seen (bars, quotes, orders). Use the chips to switch the chart to one symbol at a time.
-    Green ▲ = buy fill, red ▼ = sell fill (snapped to nearest bar). Optional URL: <code>?symbols=AAPL,MSFT</code> (first is shown until you pick another chip),
+    <strong>Green-bordered</strong> chips have fill history. Green ▲ / red ▼ on the chart = buy / sell fills at fill price.
+    Optional URL: <code>?symbols=AAPL,MSFT</code> (first is shown until you pick another chip),
     <code>minutes</code>, <code>timeframe</code>, <code>poll</code> (default 5s, min 5s, max 120s).</p>
   <div id="symbol-strip"></div>
   <div id="meta"></div>
@@ -884,62 +927,67 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
   function buildChartData(barsBySym, symList, tradeEvents) {
     const syms = (symList && symList.length) ? symList : Object.keys(barsBySym || {}).sort();
     const timeSet = new Set();
+    const evs = tradeEvents || [];
     syms.forEach(function (sym) {
       (barsBySym[sym] || []).forEach(function (row) { timeSet.add(row.t); });
+      evs.forEach(function (ev) {
+        if ((ev.symbol || "").toUpperCase() === sym.toUpperCase() && ev.t) timeSet.add(ev.t);
+      });
     });
     const utcTimes = Array.from(timeSet).sort();
     const labels = utcTimes.map(formatEt);
     const colors = ["#5ac8fa", "#ff9500", "#34c759", "#ff375f", "#bf5af2", "#ffd60a"];
-    const evs = tradeEvents || [];
     const datasets = [];
     syms.forEach(function (sym, i) {
       const rows = barsBySym[sym] || [];
       const m = {};
       rows.forEach(function (r) { m[r.t] = r.c; });
       const data = utcTimes.map(function (t) { return m[t] !== undefined ? m[t] : null; });
-      const n = utcTimes.length;
-      const buy = new Array(n).fill(false);
-      const sell = new Array(n).fill(false);
-      evs.forEach(function (ev) {
-        if ((ev.symbol || "").toUpperCase() !== sym) return;
-        const idx = closestLabelIndex(ev.t, utcTimes);
-        if ((ev.side || "").toLowerCase() === "sell") sell[idx] = true;
-        else buy[idx] = true;
-      });
-      const pointRadius = utcTimes.map(function (_, j) {
-        return (buy[j] || sell[j]) ? 9 : 0;
-      });
-      const pointBackgroundColor = utcTimes.map(function (_, j) {
-        if (buy[j] && sell[j]) return "#ffd60a";
-        if (buy[j]) return "#34c759";
-        if (sell[j]) return "#ff375f";
-        return colors[i % colors.length];
-      });
-      const pointStyle = utcTimes.map(function (_, j) {
-        if (buy[j] && sell[j]) return "star";
-        if (sell[j]) return "triangle";
-        return "triangle";
-      });
-      const pointRotation = utcTimes.map(function (_, j) {
-        if (sell[j] && !buy[j]) return 180;
-        return 0;
-      });
       datasets.push({
+        type: "line",
         label: sym,
         data: data,
         borderColor: colors[i % colors.length],
         backgroundColor: "transparent",
         spanGaps: true,
         tension: 0.12,
-        pointRadius: pointRadius,
-        pointHoverRadius: 11,
-        pointBorderWidth: 1,
-        pointBorderColor: "#111",
-        pointStyle: pointStyle,
-        pointRotation: pointRotation,
-        pointBackgroundColor: pointBackgroundColor,
-        borderWidth: 1.5
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        borderWidth: 1.5,
+        order: 1
       });
+      const fillPoints = [];
+      evs.forEach(function (ev) {
+        if ((ev.symbol || "").toUpperCase() !== sym.toUpperCase()) return;
+        const idx = utcTimes.indexOf(ev.t);
+        const useIdx = idx >= 0 ? idx : closestLabelIndex(ev.t, utcTimes);
+        const side = (ev.side || "buy").toLowerCase();
+        fillPoints.push({
+          x: useIdx,
+          y: ev.price,
+          _side: side,
+          _t: ev.t,
+          _price: ev.price
+        });
+      });
+      if (fillPoints.length) {
+        datasets.push({
+          type: "scatter",
+          label: sym + " fills",
+          data: fillPoints,
+          pointRadius: 11,
+          pointHoverRadius: 13,
+          pointBorderWidth: 1,
+          pointBorderColor: "#111",
+          pointStyle: "triangle",
+          pointRotation: fillPoints.map(function (p) { return p._side === "sell" ? 180 : 0; }),
+          pointBackgroundColor: fillPoints.map(function (p) {
+            return p._side === "sell" ? "#ff375f" : "#34c759";
+          }),
+          showLine: false,
+          order: 0
+        });
+      }
     });
     return { labels: labels, datasets: datasets, utcTimes: utcTimes };
   }
@@ -953,13 +1001,21 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       stripEl.appendChild(sp);
       return;
     }
+    const tradedSet = {};
+    (j && j.symbols_with_trades ? j.symbols_with_trades : []).forEach(function (s) {
+      tradedSet[String(s).toUpperCase()] = true;
+    });
+    const counts = (j && j.trade_counts_by_symbol) ? j.trade_counts_by_symbol : {};
     strip.forEach(function (s) {
       const b = document.createElement("button");
       b.type = "button";
-      b.textContent = s;
-      if (activeSymbol === s) b.classList.add("on");
+      const su = String(s).toUpperCase();
+      const n = counts[su] || counts[s] || 0;
+      b.textContent = n > 0 ? (su + " \u00b7" + n) : su;
+      if (activeSymbol === s || activeSymbol === su) b.classList.add("on");
+      if (tradedSet[su]) b.classList.add("has-trades");
       b.onclick = function () {
-        activeSymbol = s;
+        activeSymbol = su;
         tick();
       };
       stripEl.appendChild(b);
@@ -992,13 +1048,20 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
         legend: { labels: { color: "#ccc" } },
         tooltip: {
           callbacks: {
+            label: function (ctx) {
+              const raw = ctx.raw;
+              if (raw && raw._side) {
+                return (raw._side === "sell" ? "SELL" : "BUY") + " @ " + raw._price +
+                  "  " + formatEt(raw._t || "");
+              }
+              const y = ctx.parsed && ctx.parsed.y;
+              return (ctx.dataset.label || "") + ": " + (y != null ? y : "");
+            },
             afterLabel: function (ctx) {
+              if (ctx.dataset.type === "scatter") return "";
               const ch = ctx.chart;
               const ds = ctx.dataset;
               const i = ctx.dataIndex;
-              if (!ds.pointRadius || typeof ds.pointRadius === "number") return "";
-              const r = ds.pointRadius[i];
-              if (!r) return "";
               const utcBars = ch._barUtcTimes || [];
               const sym = ds.label || "";
               const hits = (jLast && jLast.trade_events) ? jLast.trade_events.filter(function (ev) {

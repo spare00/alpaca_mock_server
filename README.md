@@ -94,7 +94,7 @@ The page polls `GET /v1/mock/chart-series`, which uses the same bar resolution r
 The mock records tickers from `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` (`symbols=` query), and from trading routes that expose symbols (`GET /v2/positions`, `GET /v2/orders`, order lookup, `POST /v2/orders`). The chart strip is sorted tracked symbols, **not** wired to stocktrader’s strategy JSON. For chart payloads the strip is capped at **100** symbols; if more are tracked, the JSON includes `chart_symbol_strip_total` and the UI notes that the strip is partial.
 
 **Fills on the chart**  
-Buy/sell fills from the mock executor are returned as `trade_events` and drawn as markers on the active series.
+Buy/sell fills from the mock executor are returned as `trade_events` and drawn as **scatter markers** at fill price (green ▲ buy, red ▼ sell). The bar window expands to include fills outside the `minutes` lookback. Symbol chips with fill history use a **green border** and show a fill count (e.g. `RDW ·1`). JSON fields: `symbols_with_trades`, `trade_counts_by_symbol`.
 
 Example: `http://127.0.0.1:19902/chart?minutes=60&timeframe=1Min&poll=5000`
 
