@@ -15,6 +15,8 @@ See **`env.example`** for supported variable names (`ALPACA_MOCK_*`, `ALPACA_UPS
 **Alpaca historical replay (`--alpaca-date` or `ALPACA_MOCK_ALPACA_DATE` in `.env`)**  
 The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. By default the replay clock starts at `09:30` New York time and advances with server runtime; override the start time with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2024-05-13 --alpaca-time 09:35`). Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock). For `quotes/latest`, historical upstream data can omit a symbol or return unusable bid/ask; the mock then fills that symbol with a tight synthetic NBBO from the same mid used for bars / `--price`, so REST clients always receive a valid quote row per requested ticker.
 
+For **bars**, requests that send `end` and `limit` without `start` are mapped upstream using the same **limit-sized** window as live Alpaca (not a fixed small bar count), so clients like stocktrader do not need different warmup parameters under replay.
+
 **Local synthetic (default)**  
 Without `--alpaca-date`, bars and quotes are generated locally from `--price SYM=PRICE` (repeatable) and default mids (`100` per symbol).
 
@@ -44,14 +46,39 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 **Trading** (`127.0.0.1:<trading-port>`) when `EXECUTION_MODE=alpaca_paper`:
 
 - `GET /v2/clock`, `/v2/account`, `/v2/positions`, `/v2/orders`
+- `GET /v2/assets` — with upstream keys set, proxies to Alpaca; otherwise returns a built-in active US equity list from `mock_asset_universe.txt`
 - `GET /v2/orders/{uuid}`, `POST /v2/orders`, `DELETE /v2/orders/{uuid}`
 
 **Market data** (`127.0.0.1:<data-port>`):
 
 - `GET /v2/stocks/quotes/latest`
 - `GET /v2/stocks/bars` (when `ALPACA_MARKET_DATA_MODE=rest`)
-- `GET /chart` — browser chart polling `GET /v1/mock/chart-series`. Chips pick **one** symbol to chart at a time (defaults to the first tracked / URL-listed ticker). Buy/sell **fills** show as markers (`trade_events` in JSON). Example: `http://127.0.0.1:19902/chart?minutes=60&timeframe=1Min`
+- `GET /chart` — browser chart (Chart.js) polling `GET /v1/mock/chart-series`; see **Browser chart** below
+- Optional passthrough: send header `X-Alpaca-Mock-Replay: passthrough` on bars or quotes requests to forward query params to Alpaca without replay date remapping (still requires upstream keys)
 
-Diagnostics: `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `data_mode` (`local_synthetic` or `alpaca_replay`), `sim_session_minutes` (meaningful in replay mode), `market_open_flag`, `quote_tick_index`, `tracked_symbol_count` / `tracked_symbols_sample` (tickers seen from stocktrader-style requests), and replay fields when applicable.
+Diagnostics: `GET http://127.0.0.1:<data-port>/v1/mock/status` returns `data_mode` (`local_synthetic` or `alpaca_replay`), `sim_session_minutes` (meaningful in replay mode), `market_open_flag`, `quote_tick_index`, `tracked_symbol_count` / `tracked_symbols_sample` (up to 200 tickers seen on data and trading routes above), and replay fields when applicable.
+
+## Browser chart (`GET /chart`)
+
+The page polls `GET /v1/mock/chart-series`, which uses the same bar resolution rules as `GET /v2/stocks/bars` (replay clock and upstream proxy when configured). Bar times are labeled in **US/Eastern**.
+
+**Query parameters**
+
+| Parameter | Role |
+|-----------|------|
+| `minutes` | Lookback window length (clamped **5–1440**; default **120**) |
+| `timeframe` | Bar timeframe (default **1Min**) |
+| `poll` | Poll interval in **milliseconds** (clamped **5000–120000**; default 5000; values under 5s are raised to 5s) |
+| `symbols` | Optional comma-separated list. If omitted, symbol **chips** are built from **tracked** tickers (see below). If set, the chip list is fixed to that list; one symbol is charted at a time (click a chip to switch). |
+
+**Tracked symbols (chip strip without `symbols=`)**  
+The mock records tickers from `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` (`symbols=` query), and from trading routes that expose symbols (`GET /v2/positions`, `GET /v2/orders`, order lookup, `POST /v2/orders`). The chart strip is sorted tracked symbols, **not** wired to stocktrader’s strategy JSON. For chart payloads the strip is capped at **100** symbols; if more are tracked, the JSON includes `chart_symbol_strip_total` and the UI notes that the strip is partial.
+
+**Fills on the chart**  
+Buy/sell fills from the mock executor are returned as `trade_events` and drawn as markers on the active series.
+
+Example: `http://127.0.0.1:19902/chart?minutes=60&timeframe=1Min&poll=5000`
+
+## Requirements
 
 Requires Python 3.9+ (stdlib only for the server; `--alpaca-date` uses `urllib` to call Alpaca’s HTTPS data API).
