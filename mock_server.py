@@ -612,7 +612,52 @@ def _split_symbol_csv(raw: str | None) -> list[str]:
     return [s.strip().upper() for s in str(raw).split(",") if s.strip()]
 
 
-def _chart_symbols_from_qs(qs: dict[str, list[str]]) -> list[str]:
+def _quote_bp_ap(row: Any) -> tuple[float, float]:
+    """Best-effort bid/ask from Alpaca-style (``bp``/``ap``) or alternate keys."""
+    if not isinstance(row, dict):
+        return (0.0, 0.0)
+    for bk, ak in (("bp", "ap"), ("bid_price", "ask_price"), ("bid", "ask")):
+        if bk in row or ak in row:
+            try:
+                return (float(row.get(bk) or 0), float(row.get(ak) or 0))
+            except (TypeError, ValueError):
+                return (0.0, 0.0)
+    return (0.0, 0.0)
+
+
+def _replay_quote_row_usable(row: Any) -> bool:
+    bp, ap = _quote_bp_ap(row)
+    return bp > 0 and ap > 0 and ap >= bp
+
+
+def _synthetic_quote_from_mid(state: MockState, sym: str) -> dict[str, Any]:
+    """NBBO from mock mid (bars/``--price``); does not advance quote tick counter."""
+    ts = state.replay_now_utc()
+    mid = float(state.mid_price(sym, ts))
+    half = max(0.005, mid * 0.00015)
+    return {
+        "t": _iso(ts),
+        "bp": mid - half,
+        "ap": mid + half,
+        "bs": 100.0,
+        "as": 100.0,
+    }
+
+
+def _backfill_replay_latest_quotes(state: MockState, qs: dict[str, list[str]], body: dict[str, Any]) -> None:
+    """Replay ``quotes/latest``: Alpaca historical ``/v2/stocks/quotes`` can omit symbols or return empty sides."""
+    symbols = _split_symbol_csv((qs.get("symbols") or [""])[0])
+    if not symbols:
+        return
+    raw = body.get("quotes")
+    quotes: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+    changed = not isinstance(raw, dict)
+    for sym in symbols:
+        if not _replay_quote_row_usable(quotes.get(sym)):
+            quotes[sym] = _synthetic_quote_from_mid(state, sym)
+            changed = True
+    if changed:
+        body["quotes"] = quotes
     return _split_symbol_csv((qs.get("symbols") or [""])[0])
 
 
@@ -1565,7 +1610,8 @@ class DataHandler(BaseHTTPRequestHandler):
                     self.state.upstream_secret_key,
                     self.state.replay_now_utc(),
                 )
-                if code == 200:
+                if code == 200 and isinstance(body, dict):
+                    _backfill_replay_latest_quotes(self.state, qs, body)
                     self.state.remember_market_data(body)
                 self._send(code, body if isinstance(body, dict) else {"message": str(body)})
                 return
