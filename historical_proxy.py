@@ -185,6 +185,11 @@ def _session_backfill_params(
     return _iso_z(start_dt), _iso_z(end_dt)
 
 
+def _intraday_limit_backfill_start(target: date) -> datetime:
+    previous = _previous_weekday(target)
+    return datetime.combine(previous, time_of_day(4, 0), tzinfo=_NY).astimezone(timezone.utc)
+
+
 def _flatten_upstream_params(
     parsed_qs: dict[str, list[str]],
     target: date,
@@ -244,7 +249,9 @@ def _flatten_upstream_params(
 
     if "start" not in out and "end" not in out:
         end_snap = replay_now_utc
-        if limit_s and limit_s.isdigit():
+        if limit_s and limit_s.isdigit() and timeframe_to_seconds(tf) < 86400:
+            start_snap = _intraday_limit_backfill_start(target)
+        elif limit_s and limit_s.isdigit():
             lim = _effective_bar_window_limit(limit_s)
             start_snap = end_snap - timedelta(seconds=step * lim)
         else:
