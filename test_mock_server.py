@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import unittest
 
 from mock_server import MockState, _mock_chart_series, _order_payload, _strategy_from_client_order_id
@@ -20,6 +20,76 @@ class MockServerTests(unittest.TestCase):
 
         self.assertEqual(state.fill_price("HPE", "buy", now), 34.0)
         self.assertEqual(state.fill_price("HPE", "sell", now), 34.0)
+
+    def test_replay_sell_fill_rejects_quote_far_below_latest_bar(self):
+        state = MockState("100000", True, alpaca_historical_et_date=date(2026, 5, 11))
+        now = datetime(2026, 5, 11, 13, 31, 50, tzinfo=timezone.utc)
+        state.remember_market_data(
+            {
+                "bars": {
+                    "B": [
+                        {
+                            "o": 44.95,
+                            "h": 45.11,
+                            "l": 44.85,
+                            "c": 45.07,
+                            "vw": 45.038282,
+                            "t": "2026-05-11T13:31:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+        state.remember_market_quote("B", "41.6687", "41.70", "2026-05-11T13:31:50Z")
+
+        self.assertEqual(state.fill_price("B", "sell", now), 44.85)
+
+    def test_replay_buy_fill_rejects_quote_far_above_latest_bar(self):
+        state = MockState("100000", True, alpaca_historical_et_date=date(2026, 5, 11))
+        now = datetime(2026, 5, 11, 13, 31, 50, tzinfo=timezone.utc)
+        state.remember_market_data(
+            {
+                "bars": {
+                    "B": [
+                        {
+                            "o": 44.95,
+                            "h": 45.11,
+                            "l": 44.85,
+                            "c": 45.07,
+                            "vw": 45.038282,
+                            "t": "2026-05-11T13:31:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+        state.remember_market_quote("B", "48.90", "49.00", "2026-05-11T13:31:50Z")
+
+        self.assertEqual(state.fill_price("B", "buy", now), 45.11)
+
+    def test_replay_fill_keeps_quote_inside_bar_guard(self):
+        state = MockState("100000", True, alpaca_historical_et_date=date(2026, 5, 11))
+        now = datetime(2026, 5, 11, 13, 31, 50, tzinfo=timezone.utc)
+        state.remember_market_data(
+            {
+                "bars": {
+                    "B": [
+                        {
+                            "o": 44.95,
+                            "h": 45.11,
+                            "l": 44.85,
+                            "c": 45.07,
+                            "vw": 45.038282,
+                            "t": "2026-05-11T13:31:00Z",
+                        }
+                    ]
+                }
+            }
+        )
+        state.remember_market_quote("B", "44.80", "45.16", "2026-05-11T13:31:50Z")
+
+        self.assertEqual(state.fill_price("B", "sell", now), 44.8)
+        self.assertEqual(state.fill_price("B", "buy", now), 45.16)
 
     def test_strategy_is_parsed_from_bk_client_order_id(self):
         self.assertEqual(

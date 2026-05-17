@@ -108,6 +108,7 @@ _MAIN_TRADING_ORDER_UUID = re.compile(r"^/v2/orders/([0-9a-f-]{36})$", re.I)
 _MAIN_DATA_PATHS = frozenset({"/v2/stocks/bars", "/v2/stocks/quotes/latest"})
 _TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 _PASSTHROUGH_HEADER = "X-Alpaca-Mock-Replay"
+_REPLAY_FILL_BAR_GUARD_PCT = Decimal("0.02")
 _ORDER_PREFIX_STRATEGIES = {
     "gag": "gap_and_go",
     "mei": "macd_early_impulse",
@@ -317,6 +318,7 @@ class MockState:
         self.latest_market_bids: dict[str, Decimal] = {}
         self.latest_market_asks: dict[str, Decimal] = {}
         self.latest_market_price_times: dict[str, str] = {}
+        self.latest_market_bars: dict[str, dict[str, Decimal | str]] = {}
         self.sim_session_minutes: float = 0.0
         self.quote_tick_index: int = 0
         self.quote_lock = threading.Lock()
@@ -453,6 +455,31 @@ class MockState:
             if timestamp:
                 self.latest_market_price_times[sym] = str(timestamp)
 
+    def remember_market_bar(self, symbol: str, row: dict[str, Any]) -> None:
+        sym = str(symbol or "").upper()
+        if not sym:
+            return
+        close = _decimal_value(row.get("c"), "0")
+        if close <= 0:
+            return
+        bar = {
+            "o": _decimal_value(row.get("o"), close),
+            "h": _decimal_value(row.get("h"), close),
+            "l": _decimal_value(row.get("l"), close),
+            "c": close,
+            "vw": _decimal_value(row.get("vw"), close),
+            "t": str(row.get("t") or ""),
+        }
+        if bar["h"] <= 0:
+            bar["h"] = close
+        if bar["l"] <= 0:
+            bar["l"] = close
+        with self.account_lock:
+            self.latest_market_bars[sym] = bar
+            self.latest_market_prices[sym] = close
+            if bar["t"]:
+                self.latest_market_price_times[sym] = str(bar["t"])
+
     def has_market_price(self, symbol: str) -> bool:
         sym = str(symbol or "").upper()
         with self.account_lock:
@@ -490,7 +517,7 @@ class MockState:
                         latest = row
                         latest_dt = row_dt
                 if latest:
-                    self.remember_market_price(sym, latest.get("c"), latest.get("t"))
+                    self.remember_market_bar(sym, latest)
 
     def mid_price(self, symbol: str, _at: datetime) -> float:
         sym = symbol.upper()
@@ -510,9 +537,48 @@ class MockState:
                 px = self.latest_market_bids.get(sym)
             else:
                 px = None
+            bar = dict(self.latest_market_bars.get(sym) or {})
         if px is not None and px > 0:
-            return float(px)
+            bounded = self._replay_bar_bounded_fill(sym, side_norm, px, bar)
+            return float(bounded)
         return self.mid_price(sym, at)
+
+    def _replay_bar_bounded_fill(
+        self,
+        symbol: str,
+        side: str,
+        px: Decimal,
+        bar: dict[str, Decimal | str],
+    ) -> Decimal:
+        if self.alpaca_historical_et_date is None or not bar:
+            return px
+        high = bar.get("h")
+        low = bar.get("l")
+        close = bar.get("c")
+        if not isinstance(high, Decimal) or not isinstance(low, Decimal) or not isinstance(close, Decimal):
+            return px
+        if high <= 0 or low <= 0 or close <= 0:
+            return px
+        lower_guard = low * (Decimal("1") - _REPLAY_FILL_BAR_GUARD_PCT)
+        upper_guard = high * (Decimal("1") + _REPLAY_FILL_BAR_GUARD_PCT)
+        if side == "sell" and px < lower_guard:
+            fallback = low
+        elif side == "buy" and px > upper_guard:
+            fallback = high
+        else:
+            return px
+        log.info(
+            "Replay fill quote outlier %s %s quote=%s bar_low=%s bar_high=%s bar_close=%s bar_t=%s; using %s",
+            symbol,
+            side,
+            px,
+            low,
+            high,
+            close,
+            bar.get("t") or "",
+            fallback,
+        )
+        return fallback
 
     def account_payload(self) -> dict[str, Any]:
         with self.account_lock:
