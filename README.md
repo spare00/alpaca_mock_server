@@ -89,6 +89,7 @@ The page polls `GET /v1/mock/chart-series`, which uses the same bar resolution r
 | `timeframe` | Bar timeframe (default **1Min**) |
 | `poll` | Poll interval in **milliseconds** (clamped **5000–120000**; default 5000; values under 5s are raised to 5s) |
 | `symbols` | Optional comma-separated list. If omitted, symbol **chips** are built from **tracked** tickers (see below). If set, the chip list is fixed to that list; one symbol is charted at a time (click a chip to switch). |
+| `strategy` | Optional display filter for fill markers/counts, for example `strategy=steady_intraday`. Bars and mock trading behavior are unchanged. |
 
 **Tracked symbols (chip strip without `symbols=`)**  
 The mock records tickers from `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` (`symbols=` query), and from trading routes that expose symbols (`GET /v2/positions`, `GET /v2/orders`, order lookup, `POST /v2/orders`). The chart strip is sorted tracked symbols, **not** wired to stocktrader’s strategy JSON. For chart payloads the strip is capped at **100** symbols; if more are tracked, the JSON includes `chart_symbol_strip_total` and the UI notes that the strip is partial.
@@ -96,7 +97,9 @@ The mock records tickers from `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/l
 **Fills on the chart**  
 Buy/sell fills from the mock executor are returned as `trade_events` and drawn as **scatter markers** at fill price (green ▲ buy, red ▼ sell). The bar window expands to include fills outside the `minutes` lookback. Symbol chips with fill history use a **green border** and show a fill count (e.g. `RDW ·1`). JSON fields: `symbols_with_trades`, `trade_counts_by_symbol`.
 
-Example: `http://127.0.0.1:19902/chart?minutes=60&timeframe=1Min&poll=5000`
+When stocktrader sends `client_order_id` values with the `bk-<strategy-prefix>-...` format, the mock decodes the strategy and exposes strategy chips on `/chart`. Selecting a strategy only filters the displayed fills and chip counts; it does not affect bars, replay time, fills, positions, or any trading route.
+
+Example: `http://127.0.0.1:19902/chart?minutes=60&timeframe=1Min&poll=5000&strategy=steady_intraday`
 
 ## Requirements
 

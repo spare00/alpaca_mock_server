@@ -108,6 +108,16 @@ _MAIN_TRADING_ORDER_UUID = re.compile(r"^/v2/orders/([0-9a-f-]{36})$", re.I)
 _MAIN_DATA_PATHS = frozenset({"/v2/stocks/bars", "/v2/stocks/quotes/latest"})
 _TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 _PASSTHROUGH_HEADER = "X-Alpaca-Mock-Replay"
+_ORDER_PREFIX_STRATEGIES = {
+    "gag": "gap_and_go",
+    "mei": "macd_early_impulse",
+    "smr": "stoch_macd_reversal",
+    "mh7": "maha7",
+    "si": "steady_intraday",
+    "spk": "spike",
+    "oi": "opening_impulse",
+    "rec": "reconciled",
+}
 # Cap chart-series when using auto-detected symbols (many series + large bar payloads).
 _MAX_CHART_TRACKED_SYMBOLS = 100
 _MAX_TRADE_EVENTS = 5000
@@ -276,6 +286,13 @@ def _wants_passthrough(headers: Any) -> bool:
     return str(headers.get(_PASSTHROUGH_HEADER, "")).strip().lower() == "passthrough"
 
 
+def _strategy_from_client_order_id(client_order_id: Any) -> str:
+    parts = str(client_order_id or "").strip().lower().split("-")
+    if len(parts) < 2 or parts[0] != "bk":
+        return ""
+    return _ORDER_PREFIX_STRATEGIES.get(parts[1], parts[1])
+
+
 class MockState:
     def __init__(
         self,
@@ -328,13 +345,18 @@ class MockState:
     def _record_trade_fill(self, order: dict[str, Any], sym: str, side: str, price: float) -> None:
         sd = side if side in ("buy", "sell") else "buy"
         t_ev = str(order.get("filled_at") or order.get("updated_at") or _iso(_utc_now()))
+        client_order_id = str(order.get("client_order_id") or "")
+        strategy = _strategy_from_client_order_id(client_order_id)
         ev: dict[str, Any] = {
             "t": t_ev,
             "symbol": sym.upper(),
             "side": sd,
             "price": price,
             "order_id": str(order.get("id") or ""),
+            "client_order_id": client_order_id,
         }
+        if strategy:
+            ev["strategy"] = strategy
         with self._trade_events_lock:
             self.trade_events.append(ev)
             if len(self.trade_events) > _MAX_TRADE_EVENTS:
@@ -731,16 +753,40 @@ def _chart_resolve_symbol_list(state: MockState, qs: dict[str, list[str]]) -> tu
     return ["AAPL", "MSFT"], "default", extra
 
 
-def _symbols_with_trades(state: MockState) -> list[str]:
+def _chart_strategy_filter(qs: dict[str, list[str]]) -> str:
+    raw = (qs.get("strategy") or [""])[0]
+    strategy = str(raw or "").strip().lower()
+    return "" if strategy in {"", "all", "*"} else strategy
+
+
+def _trade_event_matches_strategy(ev: dict[str, Any], strategy: str) -> bool:
+    if not strategy:
+        return True
+    return str(ev.get("strategy") or "").strip().lower() == strategy
+
+
+def _trade_strategies(state: MockState) -> list[str]:
     with state._trade_events_lock:
-        syms = {str(ev.get("symbol") or "").upper() for ev in state.trade_events}
+        strategies = {str(ev.get("strategy") or "").strip().lower() for ev in state.trade_events}
+    return sorted(s for s in strategies if s)
+
+
+def _symbols_with_trades(state: MockState, strategy: str = "") -> list[str]:
+    with state._trade_events_lock:
+        syms = {
+            str(ev.get("symbol") or "").upper()
+            for ev in state.trade_events
+            if _trade_event_matches_strategy(ev, strategy)
+        }
     return sorted(s for s in syms if s)
 
 
-def _trade_counts_by_symbol(state: MockState) -> dict[str, int]:
+def _trade_counts_by_symbol(state: MockState, strategy: str = "") -> dict[str, int]:
     counts: dict[str, int] = defaultdict(int)
     with state._trade_events_lock:
         for ev in state.trade_events:
+            if not _trade_event_matches_strategy(ev, strategy):
+                continue
             sym = str(ev.get("symbol") or "").upper()
             if sym:
                 counts[sym] += 1
@@ -748,7 +794,7 @@ def _trade_counts_by_symbol(state: MockState) -> dict[str, int]:
 
 
 def _chart_bounds_for_symbols(
-    state: MockState, symbols: list[str], minutes: int
+    state: MockState, symbols: list[str], minutes: int, strategy: str = ""
 ) -> tuple[datetime, datetime]:
     """Bar window ending at replay now, widened to include any recorded fills for ``symbols``."""
     state.refresh_replay_clock_from_wall()
@@ -757,6 +803,8 @@ def _chart_bounds_for_symbols(
     symset = {s.upper() for s in symbols}
     with state._trade_events_lock:
         for ev in state.trade_events:
+            if not _trade_event_matches_strategy(ev, strategy):
+                continue
             sym = str(ev.get("symbol") or "").upper()
             if sym not in symset:
                 continue
@@ -771,7 +819,7 @@ def _chart_bounds_for_symbols(
 
 
 def _trade_events_for_chart_window(
-    state: MockState, symbols: list[str], start: datetime, end: datetime
+    state: MockState, symbols: list[str], start: datetime, end: datetime, strategy: str = ""
 ) -> list[dict[str, Any]]:
     """Fills in ``[start, end]`` for symbols on the chart (replay or wall-clock timestamps)."""
     symset = {s.upper() for s in symbols}
@@ -780,6 +828,8 @@ def _trade_events_for_chart_window(
     out: list[dict[str, Any]] = []
     pad = timedelta(seconds=1)
     for ev in snap:
+        if not _trade_event_matches_strategy(ev, strategy):
+            continue
         sym = str(ev.get("symbol") or "").upper()
         if sym not in symset:
             continue
@@ -802,6 +852,8 @@ def _trade_events_for_chart_window(
                 "side": sd,
                 "price": price,
                 "order_id": str(ev.get("order_id") or ""),
+                "client_order_id": str(ev.get("client_order_id") or ""),
+                "strategy": str(ev.get("strategy") or ""),
             }
         )
     out.sort(key=lambda e: e["t"])
@@ -811,6 +863,7 @@ def _trade_events_for_chart_window(
 def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int, dict[str, Any]]:
     """Bars for the chart UI: same upstream/synthetic rules as ``GET /v2/stocks/bars``."""
     minutes, timeframe = _chart_minutes_timeframe(qs)
+    strategy = _chart_strategy_filter(qs)
     symbols, symbol_source, symbol_extra = _chart_resolve_symbol_list(state, qs)
     with state._tracked_symbols_lock:
         strip_full = sorted(state.tracked_symbols)
@@ -820,7 +873,7 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
     strip_meta: dict[str, Any] = {"chart_symbol_strip": chart_strip}
     if len(strip_full) > _MAX_CHART_TRACKED_SYMBOLS:
         strip_meta["chart_symbol_strip_total"] = len(strip_full)
-    start, end = _chart_bounds_for_symbols(state, symbols, minutes)
+    start, end = _chart_bounds_for_symbols(state, symbols, minutes, strategy)
     bar_qs: dict[str, list[str]] = {
         "symbols": [",".join(symbols)],
         "timeframe": [timeframe],
@@ -837,9 +890,11 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
         "timeframe": timeframe,
         "symbols": symbols,
         "symbol_source": symbol_source,
-        "trade_events": _trade_events_for_chart_window(state, symbols, start, end),
-        "symbols_with_trades": _symbols_with_trades(state),
-        "trade_counts_by_symbol": _trade_counts_by_symbol(state),
+        "strategy": strategy,
+        "trade_strategies": _trade_strategies(state),
+        "trade_events": _trade_events_for_chart_window(state, symbols, start, end, strategy),
+        "symbols_with_trades": _symbols_with_trades(state, strategy),
+        "trade_counts_by_symbol": _trade_counts_by_symbol(state, strategy),
         **strip_meta,
         **symbol_extra,
     }
@@ -878,13 +933,14 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
   body { font-family: system-ui, sans-serif; margin: 16px; background: #111; color: #e8e8e8; }
   #meta { font-size: 13px; opacity: 0.85; margin-bottom: 12px; }
   #err { color: #ff6b6b; margin-bottom: 8px; min-height: 1.2em; }
-  #symbol-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
-  #symbol-strip button { cursor: pointer; padding: 6px 12px; border-radius: 8px; border: 1px solid #444;
+  #strategy-strip, #symbol-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  #strategy-strip button, #symbol-strip button { cursor: pointer; padding: 6px 12px; border-radius: 8px; border: 1px solid #444;
     background: #222; color: #eee; font-size: 13px; }
+  #strategy-strip button.on,
   #symbol-strip button.on { background: #2a4a6a; border-color: #5ac8fa; }
   #symbol-strip button.has-trades:not(.on) { background: #1a2e24; border-color: #34c759; color: #d8ffe8; }
   #symbol-strip button.has-trades.on { border-color: #7dffb0; box-shadow: 0 0 0 1px #34c75966; }
-  #symbol-strip .hint { font-size: 12px; opacity: 0.75; margin-left: 4px; }
+  #strategy-strip .hint, #symbol-strip .hint { font-size: 12px; opacity: 0.75; margin-left: 4px; }
   canvas { max-height: 68vh; }
   a { color: #7ecbff; }
 </style>
@@ -893,8 +949,11 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
   <h1>Mock data — bar chart</h1>
   <p>Tickers come from what the mock has seen (bars, quotes, orders). Use the chips to switch the chart to one symbol at a time.
     <strong>Green-bordered</strong> chips have fill history. Green ▲ / red ▼ on the chart = buy / sell fills at fill price.
+    Strategy chips filter only displayed fills, not bars or mock trading behavior.
     Optional URL: <code>?symbols=AAPL,MSFT</code> (first is shown until you pick another chip),
+    <code>strategy=steady_intraday</code>,
     <code>minutes</code>, <code>timeframe</code>, <code>poll</code> (default 5s, min 5s, max 120s).</p>
+  <div id="strategy-strip"></div>
   <div id="symbol-strip"></div>
   <div id="meta"></div>
   <div id="err"></div>
@@ -909,12 +968,14 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
     : [];
   const minutes = params.get("minutes") || "120";
   const timeframe = params.get("timeframe") || "1Min";
+  let activeStrategy = (params.get("strategy") || "all").trim().toLowerCase() || "all";
   let pollMs = parseInt(params.get("poll") || "5000", 10);
   if (!isFinite(pollMs)) pollMs = 5000;
   pollMs = Math.max(5000, Math.min(pollMs, 120000));
 
   const urlLocked = symbolsOverride.length > 0;
   let activeSymbol = null;
+  const strategyEl = document.getElementById("strategy-strip");
   const stripEl = document.getElementById("symbol-strip");
 
   function getStripList(j) {
@@ -1006,7 +1067,8 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
           y: ev.price,
           _side: side,
           _t: ev.t,
-          _price: ev.price
+          _price: ev.price,
+          _strategy: ev.strategy || ""
         });
       });
       if (fillPoints.length) {
@@ -1030,6 +1092,30 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       }
     });
     return { datasets: datasets, utcTimes: utcTimes };
+  }
+
+  function renderStrategyStrip(j) {
+    strategyEl.innerHTML = "";
+    const strategies = ["all"].concat((j && j.trade_strategies ? j.trade_strategies : []).filter(function (s) {
+      return s && s !== "all";
+    }));
+    strategies.forEach(function (strategy) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = strategy;
+      if (activeStrategy === strategy) b.classList.add("on");
+      b.onclick = function () {
+        activeStrategy = strategy;
+        tick();
+      };
+      strategyEl.appendChild(b);
+    });
+    if (strategies.length === 1) {
+      const sp = document.createElement("span");
+      sp.className = "hint";
+      sp.textContent = "strategy chips appear after bk-prefixed strategy orders fill";
+      strategyEl.appendChild(sp);
+    }
   }
 
   function renderSymbolStrip(strip, j) {
@@ -1105,7 +1191,8 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
             label: function (ctx) {
               const raw = ctx.raw;
               if (raw && raw._side) {
-                return (raw._side === "sell" ? "SELL" : "BUY") + " @ " + raw._price +
+                const strategy = raw._strategy ? (" [" + raw._strategy + "]") : "";
+                return (raw._side === "sell" ? "SELL" : "BUY") + strategy + " @ " + raw._price +
                   "  " + formatEt(raw._t || "");
               }
               const y = ctx.parsed && ctx.parsed.y;
@@ -1125,7 +1212,8 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
               }) : [];
               if (!hits.length) return "";
               return hits.map(function (h) {
-                return (h.side || "") + " " + (h.price != null ? h.price : "") + " @ " + formatEt(h.t || "");
+                const strategy = h.strategy ? (" [" + h.strategy + "]") : "";
+                return (h.side || "") + strategy + " " + (h.price != null ? h.price : "") + " @ " + formatEt(h.t || "");
               }).join("\\n");
             }
           }
@@ -1166,6 +1254,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
     }
     u.searchParams.set("minutes", minutes);
     u.searchParams.set("timeframe", timeframe);
+    if (activeStrategy && activeStrategy !== "all") u.searchParams.set("strategy", activeStrategy);
     const errEl = document.getElementById("err");
     try {
       const r = await fetch(u.toString(), { cache: "no-store" });
@@ -1185,6 +1274,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       }
       jLast = j;
       errEl.textContent = "";
+      renderStrategyStrip(j);
       const meta = document.getElementById("meta");
       const symList = j.symbols || Object.keys(j.bars || {}).sort();
       let capNote = "";
@@ -1194,6 +1284,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
         (j.data_mode || "") + "  source=" + (j.symbol_source || "") + capNote +
         "  replay_now (US/Eastern)=" + formatEt(j.replay_now_utc || "") +
         "  showing=" + (activeSymbol || "") +
+        "  strategy=" + (activeStrategy || "all") +
         "  series=" + symList.length + "  fills_in_window=" + nTr +
         "  bars: " + symList.map(function (s) {
           var a = (j.bars && j.bars[s]) ? j.bars[s].length : 0;
