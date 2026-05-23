@@ -148,6 +148,53 @@ class MockServerTests(unittest.TestCase):
         self.assertEqual(body["trade_counts_by_symbol"], {"UBER": 1})
         self.assertEqual(len(body["trade_events"]), 1)
         self.assertEqual(body["trade_events"][0]["strategy"], "steady_intraday")
+        self.assertEqual(body["trade_events"][0]["qty"], "1")
+        self.assertEqual(body["trade_events"][0]["fill_stage"], "entry")
+
+    def test_trade_events_mark_partial_and_full_sell_quantities(self):
+        state = MockState("100000", True)
+        now = datetime(2026, 5, 14, 13, 36, tzinfo=timezone.utc)
+        state.remember_market_price("BB", "10.00", "2026-05-14T13:36:00Z")
+        state.record_tracked_symbols(["BB"])
+
+        buy_order = _order_payload(
+            "11111111-1111-4111-8111-111111111111",
+            {"symbol": "BB", "qty": "10", "side": "buy"},
+            "filled",
+            "10",
+            "10.00",
+            now,
+        )
+        partial_sell = _order_payload(
+            "22222222-2222-4222-8222-222222222222",
+            {"symbol": "BB", "qty": "4", "side": "sell"},
+            "filled",
+            "4",
+            "10.50",
+            now,
+        )
+        full_sell = _order_payload(
+            "33333333-3333-4333-8333-333333333333",
+            {"symbol": "BB", "qty": "6", "side": "sell"},
+            "filled",
+            "6",
+            "11.00",
+            now,
+        )
+
+        state.apply_fill(buy_order)
+        state.apply_fill(partial_sell)
+        state.apply_fill(full_sell)
+
+        code, body = _mock_chart_series(
+            state,
+            {"symbols": ["BB"], "minutes": ["60"], "timeframe": ["1Min"]},
+        )
+
+        self.assertEqual(code, 200)
+        events = body["trade_events"]
+        self.assertEqual([ev["qty"] for ev in events], ["10", "4", "6"])
+        self.assertEqual([ev["fill_stage"] for ev in events], ["entry", "partial", "full"])
 
 
 if __name__ == "__main__":

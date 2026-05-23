@@ -344,16 +344,31 @@ class MockState:
         with self._tracked_symbols_lock:
             self.tracked_symbols.update(syms)
 
-    def _record_trade_fill(self, order: dict[str, Any], sym: str, side: str, price: float) -> None:
+    def _record_trade_fill(
+        self,
+        order: dict[str, Any],
+        sym: str,
+        side: str,
+        qty: Decimal,
+        price: float,
+        prior_qty: Decimal,
+    ) -> None:
         sd = side if side in ("buy", "sell") else "buy"
         t_ev = str(order.get("filled_at") or order.get("updated_at") or _iso(_utc_now()))
         client_order_id = str(order.get("client_order_id") or "")
         strategy = _strategy_from_client_order_id(client_order_id)
+        fill_stage = ""
+        if sd == "buy":
+            fill_stage = "add" if prior_qty > 0 else "entry"
+        elif prior_qty > 0:
+            fill_stage = "full" if qty >= prior_qty else "partial"
         ev: dict[str, Any] = {
             "t": t_ev,
             "symbol": sym.upper(),
             "side": sd,
+            "qty": _decimal_str(qty),
             "price": price,
+            "fill_stage": fill_stage,
             "order_id": str(order.get("id") or ""),
             "client_order_id": client_order_id,
         }
@@ -653,9 +668,10 @@ class MockState:
         side = str(order.get("side") or "buy").lower()
         if side not in ("buy", "sell"):
             side = "buy"
-        signed_qty = qty if side == "buy" else -qty
-        self._record_trade_fill(order, sym, side, float(px))
         with self.account_lock:
+            signed_qty = qty if side == "buy" else -qty
+            prior_qty = self.positions.get(sym, {}).get("qty", Decimal("0"))
+            self._record_trade_fill(order, sym, side, qty, float(px), prior_qty)
             self.cash -= signed_qty * px
             pos = self.positions.get(sym)
             if pos is None:
@@ -916,7 +932,9 @@ def _trade_events_for_chart_window(
                 "t": str(ev.get("t") or ""),
                 "symbol": sym,
                 "side": sd,
+                "qty": str(ev.get("qty") or ""),
                 "price": price,
+                "fill_stage": str(ev.get("fill_stage") or ""),
                 "order_id": str(ev.get("order_id") or ""),
                 "client_order_id": str(ev.get("client_order_id") or ""),
                 "strategy": str(ev.get("strategy") or ""),
@@ -1133,7 +1151,9 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
           y: ev.price,
           _side: side,
           _t: ev.t,
+          _qty: ev.qty || "",
           _price: ev.price,
+          _fillStage: ev.fill_stage || "",
           _strategy: ev.strategy || ""
         });
       });
@@ -1258,7 +1278,9 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
               const raw = ctx.raw;
               if (raw && raw._side) {
                 const strategy = raw._strategy ? (" [" + raw._strategy + "]") : "";
-                return (raw._side === "sell" ? "SELL" : "BUY") + strategy + " @ " + raw._price +
+                const qty = raw._qty ? (" x" + raw._qty) : "";
+                const stage = raw._side === "sell" && raw._fillStage ? (" " + raw._fillStage) : "";
+                return (raw._side === "sell" ? "SELL" : "BUY") + stage + qty + strategy + " @ " + raw._price +
                   "  " + formatEt(raw._t || "");
               }
               const y = ctx.parsed && ctx.parsed.y;
