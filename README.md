@@ -31,7 +31,7 @@ Other flags/env vars are **not** used to fake market prices in normal replay, bu
 | Item | Role |
 |------|------|
 | `--alpaca-time` / `ALPACA_MOCK_ALPACA_TIME` | Where the **replay clock** starts on that ET date (default `09:30`). Configuration, not a price override. |
-| `--replay-speed` / `ALPACA_MOCK_REPLAY_SPEED` | Replay clock multiplier (default `1`). `3` means three replay seconds per real second; lower stocktrader polling if you need the same replay-time sampling density. |
+| `--replay-speed` / `ALPACA_MOCK_REPLAY_SPEED` | Replay clock multiplier (default `3`). `3` means three replay seconds per real second; lower stocktrader polling if you need the same replay-time sampling density. |
 | `--cash` / `ALPACA_MOCK_CASH` | Starting balance for the **local paper ledger** only (`GET /v2/account`). Unrelated to SIP/IEX replay. |
 | `--market-closed` / `ALPACA_MOCK_MARKET_CLOSED` | Forces **`GET /v2/clock` → `is_open=false`**. Use only if you intentionally want the mock to report a closed session. |
 | `X-Alpaca-Mock-Replay: passthrough` (header) | On bars/quotes, forwards the request to Alpaca **without** replay date remapping. Escape hatch, not default replay. |

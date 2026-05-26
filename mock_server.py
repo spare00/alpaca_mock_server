@@ -303,7 +303,7 @@ class MockState:
         *,
         alpaca_historical_et_date: date | None = None,
         alpaca_historical_et_time: time_of_day | None = None,
-        replay_speed: float = 1.0,
+        replay_speed: float = 3.0,
         upstream_data_url: str = "https://data.alpaca.markets",
         upstream_trading_url: str = "https://paper-api.alpaca.markets",
         upstream_api_key: str | None = None,
@@ -327,7 +327,7 @@ class MockState:
         self.quote_last_emit_utc: datetime | None = None
         self.alpaca_historical_et_date = alpaca_historical_et_date
         self.alpaca_historical_et_time = alpaca_historical_et_time
-        self.replay_speed = max(0.01, float(replay_speed or 1.0))
+        self.replay_speed = max(0.01, float(replay_speed or 3.0))
         self.replay_wall_started_utc = _utc_now()
         self.replay_started_utc = self._initial_replay_utc()
         self.upstream_data_url = (upstream_data_url or "https://data.alpaca.markets").rstrip("/")
@@ -2020,12 +2020,12 @@ def main() -> None:
     p.add_argument(
         "--replay-speed",
         type=float,
-        default=env_float("ALPACA_MOCK_REPLAY_SPEED", 1.0),
+        default=env_float("ALPACA_MOCK_REPLAY_SPEED", 3.0),
         metavar="N",
         help=(
             "Replay clock speed multiplier when --alpaca-date is active. "
             "For example, 3 means one real second advances three replay seconds. "
-            "Default: 1 or ALPACA_MOCK_REPLAY_SPEED."
+            "Default: 3 or ALPACA_MOCK_REPLAY_SPEED."
         ),
     )
     p.add_argument(
