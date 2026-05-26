@@ -1,6 +1,8 @@
 from datetime import date, datetime, timezone
 import unittest
+from unittest.mock import patch
 
+import mock_server
 from mock_server import MockState, _mock_chart_series, _order_payload, _strategy_from_client_order_id
 
 
@@ -90,6 +92,21 @@ class MockServerTests(unittest.TestCase):
 
         self.assertEqual(state.fill_price("B", "sell", now), 44.8)
         self.assertEqual(state.fill_price("B", "buy", now), 45.16)
+
+    def test_replay_clock_uses_speed_multiplier(self):
+        wall_start = datetime(2026, 5, 26, 0, 0, 0, tzinfo=timezone.utc)
+        wall_now = datetime(2026, 5, 26, 0, 0, 10, tzinfo=timezone.utc)
+        replay_start = datetime(2026, 5, 11, 13, 30, 0, tzinfo=timezone.utc)
+        with patch.object(mock_server, "_utc_now", side_effect=[wall_start, wall_now]):
+            state = MockState(
+                "100000",
+                True,
+                alpaca_historical_et_date=date(2026, 5, 11),
+                replay_speed=3.0,
+            )
+            state.replay_started_utc = replay_start
+
+            self.assertEqual(state.replay_now_utc(), datetime(2026, 5, 11, 13, 30, 30, tzinfo=timezone.utc))
 
     def test_strategy_is_parsed_from_bk_client_order_id(self):
         self.assertEqual(

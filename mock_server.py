@@ -91,6 +91,7 @@ from historical_proxy import (
 )
 from mock_env import (
     env_bool,
+    env_float,
     env_int,
     env_str,
     load_dotenv,
@@ -302,6 +303,7 @@ class MockState:
         *,
         alpaca_historical_et_date: date | None = None,
         alpaca_historical_et_time: time_of_day | None = None,
+        replay_speed: float = 1.0,
         upstream_data_url: str = "https://data.alpaca.markets",
         upstream_trading_url: str = "https://paper-api.alpaca.markets",
         upstream_api_key: str | None = None,
@@ -325,6 +327,7 @@ class MockState:
         self.quote_last_emit_utc: datetime | None = None
         self.alpaca_historical_et_date = alpaca_historical_et_date
         self.alpaca_historical_et_time = alpaca_historical_et_time
+        self.replay_speed = max(0.01, float(replay_speed or 1.0))
         self.replay_wall_started_utc = _utc_now()
         self.replay_started_utc = self._initial_replay_utc()
         self.upstream_data_url = (upstream_data_url or "https://data.alpaca.markets").rstrip("/")
@@ -400,7 +403,8 @@ class MockState:
             return _utc_now()
         if self.replay_started_utc is None:
             return snap_datetime_to_target_et_date(_utc_now(), self.alpaca_historical_et_date)
-        return self.replay_started_utc + (_utc_now() - self.replay_wall_started_utc)
+        elapsed = _utc_now() - self.replay_wall_started_utc
+        return self.replay_started_utc + timedelta(seconds=elapsed.total_seconds() * self.replay_speed)
 
     def replay_market_is_open(self) -> bool:
         if not self.market_open:
@@ -970,6 +974,7 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
     meta: dict[str, Any] = {
         "replay_now_utc": _iso(end),
         "data_mode": data_mode,
+        "replay_speed": state.replay_speed,
         "minutes": minutes,
         "timeframe": timeframe,
         "symbols": symbols,
@@ -1371,6 +1376,7 @@ _CHART_PAGE_HTML = """<!DOCTYPE html>
       meta.textContent =
         (j.data_mode || "") + "  source=" + (j.symbol_source || "") + capNote +
         "  replay_now (US/Eastern)=" + formatEt(j.replay_now_utc || "") +
+        "  speed=" + (j.replay_speed || 1) + "x" +
         "  showing=" + (activeSymbol || "") +
         "  strategy=" + (activeStrategy || "all") +
         "  series=" + symList.length + "  fills_in_window=" + nTr +
@@ -1806,6 +1812,7 @@ class DataHandler(BaseHTTPRequestHandler):
                     "alpaca_historical_et_time": st.alpaca_historical_et_time.strftime("%H:%M")
                     if st.alpaca_historical_et_time
                     else None,
+                    "replay_speed": st.replay_speed,
                     "upstream_data_url": st.upstream_data_url if st.alpaca_historical_et_date else None,
                     "synthetic_timestamp_utc": syn,
                     "market_open_flag": st.replay_market_is_open(),
@@ -2011,6 +2018,17 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--replay-speed",
+        type=float,
+        default=env_float("ALPACA_MOCK_REPLAY_SPEED", 1.0),
+        metavar="N",
+        help=(
+            "Replay clock speed multiplier when --alpaca-date is active. "
+            "For example, 3 means one real second advances three replay seconds. "
+            "Default: 1 or ALPACA_MOCK_REPLAY_SPEED."
+        ),
+    )
+    p.add_argument(
         "--upstream-trading-url",
         type=str,
         default=env_str("ALPACA_UPSTREAM_TRADING_URL", "https://paper-api.alpaca.markets")
@@ -2051,6 +2069,8 @@ def main() -> None:
         args.access_log = True
     if env_bool("ALPACA_MOCK_VERBOSE"):
         args.verbose = True
+    if args.replay_speed is None or args.replay_speed <= 0:
+        p.error("--replay-speed must be greater than 0")
     for part in env_str("ALPACA_MOCK_PRICE").split(","):
         piece = part.strip()
         if "=" in piece:
@@ -2081,6 +2101,7 @@ def main() -> None:
         market_open=not args.market_closed,
         alpaca_historical_et_date=alpaca_hist,
         alpaca_historical_et_time=alpaca_hist_time,
+        replay_speed=args.replay_speed,
         upstream_data_url=args.upstream_data_url,
         upstream_trading_url=args.upstream_trading_url,
         upstream_api_key=str(args.upstream_api_key).strip() or None,
@@ -2120,7 +2141,7 @@ def main() -> None:
         if alpaca_hist.weekday() >= 5:
             weekend_note = "  Warning: replay date is a weekend; upstream equity data will usually be empty.\n"
         alpaca_line = (
-            f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} | upstream data={args.upstream_data_url.rstrip('/')}\n"
+            f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} speed={args.replay_speed:g}x | upstream data={args.upstream_data_url.rstrip('/')}\n"
             f"{weekend_note}"
         )
     print(
