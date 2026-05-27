@@ -123,6 +123,7 @@ _ORDER_PREFIX_STRATEGIES = {
 # Cap chart-series when using auto-detected symbols (many series + large bar payloads).
 _MAX_CHART_TRACKED_SYMBOLS = 100
 _MAX_TRADE_EVENTS = 5000
+_DEFAULT_REPLAY_CACHE_DIR = "/tmp/alpaca_mock_replay_cache"
 
 
 def _utc_now() -> datetime:
@@ -286,6 +287,15 @@ def _trading_get_assets(state: MockState, qs: dict[str, list[str]]) -> tuple[int
 
 def _wants_passthrough(headers: Any) -> bool:
     return str(headers.get(_PASSTHROUGH_HEADER, "")).strip().lower() == "passthrough"
+
+
+def _resolve_replay_cache_dir(raw: Any) -> str | None:
+    value = str(raw or "").strip()
+    if not value:
+        return _DEFAULT_REPLAY_CACHE_DIR
+    if value.lower() in {"0", "false", "no", "none", "off", "disabled"}:
+        return None
+    return value
 
 
 def _strategy_from_client_order_id(client_order_id: Any) -> str:
@@ -2079,11 +2089,12 @@ def main() -> None:
     p.add_argument(
         "--replay-cache-dir",
         type=str,
-        default=env_str("ALPACA_MOCK_REPLAY_CACHE_DIR", ""),
+        default=env_str("ALPACA_MOCK_REPLAY_CACHE_DIR", _DEFAULT_REPLAY_CACHE_DIR),
         metavar="PATH",
         help=(
             "Optional file cache directory for historical replay bars/quotes "
-            "(env ALPACA_MOCK_REPLAY_CACHE_DIR). Sharing this path makes separate mock servers reuse the same data."
+            f"(env ALPACA_MOCK_REPLAY_CACHE_DIR, default: {_DEFAULT_REPLAY_CACHE_DIR}; use 'off' to disable). "
+            "Sharing this path makes separate mock servers reuse the same data."
         ),
     )
     p.add_argument("-v", "--verbose", action="store_true", help="Stdlib HTTP request line logging (Apache-style)")
@@ -2106,6 +2117,7 @@ def main() -> None:
         p.error("--replay-speed must be greater than 0")
     if args.replay_step_seconds is None or args.replay_step_seconds < 0:
         p.error("--replay-step-seconds must be zero or greater")
+    replay_cache_dir = _resolve_replay_cache_dir(args.replay_cache_dir)
     for part in env_str("ALPACA_MOCK_PRICE").split(","):
         piece = part.strip()
         if "=" in piece:
@@ -2141,7 +2153,7 @@ def main() -> None:
         upstream_trading_url=args.upstream_trading_url,
         upstream_api_key=str(args.upstream_api_key).strip() or None,
         upstream_secret_key=str(args.upstream_secret_key).strip() or None,
-        replay_cache_dir=str(args.replay_cache_dir).strip() or None,
+        replay_cache_dir=replay_cache_dir,
         replay_step_seconds=args.replay_step_seconds,
     )
     for item in args.price:
@@ -2179,7 +2191,7 @@ def main() -> None:
             weekend_note = "  Warning: replay date is a weekend; upstream equity data will usually be empty.\n"
         alpaca_line = (
             f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} speed={args.replay_speed:g}x | upstream data={args.upstream_data_url.rstrip('/')}\n"
-            f"  Replay cache: {str(args.replay_cache_dir).strip() or 'off'}\n"
+            f"  Replay cache: {replay_cache_dir or 'off'}\n"
             f"  Replay step: {args.replay_step_seconds:g}s\n"
             f"{weekend_note}"
         )

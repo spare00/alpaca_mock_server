@@ -4,9 +4,15 @@ from unittest.mock import patch
 
 import mock_server
 from mock_server import MockState, _mock_chart_series, _order_payload, _strategy_from_client_order_id
+from mock_server import _resolve_replay_cache_dir
 
 
 class MockServerTests(unittest.TestCase):
+    def test_replay_cache_defaults_to_tmp_and_can_be_disabled(self):
+        self.assertEqual(_resolve_replay_cache_dir(""), "/tmp/alpaca_mock_replay_cache")
+        self.assertIsNone(_resolve_replay_cache_dir("off"))
+        self.assertEqual(_resolve_replay_cache_dir("/private/tmp/custom"), "/private/tmp/custom")
+
     def test_market_fill_uses_quote_side(self):
         state = MockState("100000", True)
         now = datetime(2026, 5, 14, 13, 36, tzinfo=timezone.utc)
