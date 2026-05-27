@@ -308,6 +308,7 @@ class MockState:
         upstream_trading_url: str = "https://paper-api.alpaca.markets",
         upstream_api_key: str | None = None,
         upstream_secret_key: str | None = None,
+        replay_cache_dir: str | None = None,
     ) -> None:
         self.starting_cash = starting_cash
         self.cash = _decimal_value(starting_cash)
@@ -334,6 +335,7 @@ class MockState:
         self.upstream_trading_url = (upstream_trading_url or "https://paper-api.alpaca.markets").rstrip("/")
         self.upstream_api_key = upstream_api_key
         self.upstream_secret_key = upstream_secret_key
+        self.replay_cache_dir = replay_cache_dir
         self._tracked_symbols_lock = threading.Lock()
         self.tracked_symbols: set[str] = set()
         self._trade_events_lock = threading.Lock()
@@ -999,6 +1001,7 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
             state.upstream_api_key,
             state.upstream_secret_key,
             state.replay_now_utc(),
+            state.replay_cache_dir,
         )
         if isinstance(body, dict):
             out = dict(meta)
@@ -1701,6 +1704,7 @@ class TradingHandler(BaseHTTPRequestHandler):
                 self.state.upstream_api_key,
                 self.state.upstream_secret_key,
                 now,
+                self.state.replay_cache_dir,
             )
             if code == 200:
                 self.state.remember_market_data(quote_body)
@@ -1876,6 +1880,7 @@ class DataHandler(BaseHTTPRequestHandler):
                     self.state.upstream_api_key,
                     self.state.upstream_secret_key,
                     self.state.replay_now_utc(),
+                    self.state.replay_cache_dir,
                 )
                 if code == 200:
                     self.state.remember_market_data(body)
@@ -1924,6 +1929,7 @@ class DataHandler(BaseHTTPRequestHandler):
                     self.state.upstream_api_key,
                     self.state.upstream_secret_key,
                     self.state.replay_now_utc(),
+                    self.state.replay_cache_dir,
                 )
                 if code == 200 and isinstance(body, dict):
                     _backfill_replay_latest_quotes(self.state, qs, body)
@@ -2053,6 +2059,16 @@ def main() -> None:
         default=env_str("ALPACA_UPSTREAM_SECRET_KEY", ""),
         help="Alpaca API secret for upstream data fetches (env ALPACA_UPSTREAM_SECRET_KEY).",
     )
+    p.add_argument(
+        "--replay-cache-dir",
+        type=str,
+        default=env_str("ALPACA_MOCK_REPLAY_CACHE_DIR", ""),
+        metavar="PATH",
+        help=(
+            "Optional file cache directory for historical replay bars/quotes "
+            "(env ALPACA_MOCK_REPLAY_CACHE_DIR). Sharing this path makes separate mock servers reuse the same data."
+        ),
+    )
     p.add_argument("-v", "--verbose", action="store_true", help="Stdlib HTTP request line logging (Apache-style)")
     p.add_argument(
         "--access-log",
@@ -2106,6 +2122,7 @@ def main() -> None:
         upstream_trading_url=args.upstream_trading_url,
         upstream_api_key=str(args.upstream_api_key).strip() or None,
         upstream_secret_key=str(args.upstream_secret_key).strip() or None,
+        replay_cache_dir=str(args.replay_cache_dir).strip() or None,
     )
     for item in args.price:
         if "=" not in item:
@@ -2142,6 +2159,7 @@ def main() -> None:
             weekend_note = "  Warning: replay date is a weekend; upstream equity data will usually be empty.\n"
         alpaca_line = (
             f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} speed={args.replay_speed:g}x | upstream data={args.upstream_data_url.rstrip('/')}\n"
+            f"  Replay cache: {str(args.replay_cache_dir).strip() or 'off'}\n"
             f"{weekend_note}"
         )
     print(

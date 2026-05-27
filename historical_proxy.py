@@ -16,11 +16,15 @@ of wall-clock "today" (no ``--as-of-date`` required on stocktrader).
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import re
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, time as time_of_day, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -321,6 +325,76 @@ def upstream_get_json(
         return 502, None, str(exc.reason or exc)
 
 
+def _canonical_cache_payload(path: str, target: date, params: dict[str, str]) -> str:
+    payload = {
+        "path": path,
+        "target": target.isoformat(),
+        "params": {key: params[key] for key in sorted(params)},
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _cache_path(cache_dir: str | Path | None, path: str, target: date, params: dict[str, str]) -> Path | None:
+    if not cache_dir:
+        return None
+    digest = hashlib.sha256(_canonical_cache_payload(path, target, params).encode("utf-8")).hexdigest()
+    endpoint = path.strip("/").replace("/", "_")
+    feed = (params.get("feed") or "default").lower()
+    return Path(cache_dir).expanduser() / target.isoformat() / feed / f"{endpoint}-{digest}.json"
+
+
+def _read_cache(path: Path | None) -> tuple[int, Any] | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    status = payload.get("status")
+    body = payload.get("body")
+    if isinstance(status, int) and body is not None:
+        return status, body
+    return None
+
+
+def _write_cache(path: Path | None, status: int, body: Any) -> None:
+    if path is None or status != 200 or body is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"status": status, "body": body}, fh, separators=(",", ":"), sort_keys=True)
+        os.replace(tmp_name, path)
+    except OSError:
+        try:
+            if "tmp_name" in locals():
+                os.unlink(tmp_name)
+        except OSError:
+            pass
+
+
+def _cached_upstream_get_json(
+    cache_dir: str | Path | None,
+    path: str,
+    target: date,
+    base_url: str,
+    params: dict[str, str],
+    api_key: str,
+    secret_key: str,
+    timeout: float = 60.0,
+) -> tuple[int, Any | None, str]:
+    path_on_disk = _cache_path(cache_dir, path, target, params)
+    cached = _read_cache(path_on_disk)
+    if cached is not None:
+        status, body = cached
+        return status, body, ""
+    status, body, err = upstream_get_json(base_url, path, params, api_key, secret_key, timeout=timeout)
+    if status == 200 and body is not None:
+        _write_cache(path_on_disk, status, body)
+    return status, body, err
+
+
 def proxy_stock_bars(
     parsed_qs: dict[str, list[str]],
     target: date,
@@ -328,11 +402,20 @@ def proxy_stock_bars(
     api_key: str,
     secret_key: str,
     replay_now_utc: datetime | None = None,
+    cache_dir: str | Path | None = None,
 ) -> tuple[int, Any]:
     params = _flatten_upstream_params(parsed_qs, target, replay_now_utc)
     if not params.get("symbols"):
         return 400, {"message": "missing symbols"}
-    status, body, err = upstream_get_json(base_url, "/v2/stocks/bars", params, api_key, secret_key)
+    status, body, err = _cached_upstream_get_json(
+        cache_dir,
+        "/v2/stocks/bars",
+        target,
+        base_url,
+        params,
+        api_key,
+        secret_key,
+    )
     if body is None:
         return status, {"message": err or "upstream error"}
     return status, body
@@ -356,6 +439,7 @@ def proxy_quotes_latest(
     api_key: str,
     secret_key: str,
     replay_now_utc: datetime | None = None,
+    cache_dir: str | Path | None = None,
 ) -> tuple[int, Any]:
     symbols_raw = (_first(parsed_qs, "symbols") or "").split(",")
     symbols = [s.strip().upper() for s in symbols_raw if s.strip()]
@@ -378,8 +462,15 @@ def proxy_quotes_latest(
             "sort": "desc",
             "feed": feed,
         }
-        status, body, _ = upstream_get_json(
-            base_url, "/v2/stocks/quotes", params, api_key, secret_key, timeout=90.0
+        status, body, _ = _cached_upstream_get_json(
+            cache_dir,
+            "/v2/stocks/quotes",
+            target,
+            base_url,
+            params,
+            api_key,
+            secret_key,
+            timeout=90.0,
         )
         if status != 200 or not isinstance(body, dict):
             continue
