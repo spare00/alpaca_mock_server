@@ -108,6 +108,22 @@ class MockServerTests(unittest.TestCase):
 
             self.assertEqual(state.replay_now_utc(), datetime(2026, 5, 11, 13, 30, 30, tzinfo=timezone.utc))
 
+    def test_replay_clock_can_snap_to_fixed_step(self):
+        wall_start = datetime(2026, 5, 26, 0, 0, 0, tzinfo=timezone.utc)
+        wall_now = datetime(2026, 5, 26, 0, 0, 11, tzinfo=timezone.utc)
+        replay_start = datetime(2026, 5, 11, 13, 30, 0, tzinfo=timezone.utc)
+        with patch.object(mock_server, "_utc_now", side_effect=[wall_start, wall_now]):
+            state = MockState(
+                "100000",
+                True,
+                alpaca_historical_et_date=date(2026, 5, 11),
+                replay_speed=3.0,
+                replay_step_seconds=30.0,
+            )
+            state.replay_started_utc = replay_start
+
+            self.assertEqual(state.replay_now_utc(), datetime(2026, 5, 11, 13, 30, 30, tzinfo=timezone.utc))
+
     def test_strategy_is_parsed_from_bk_client_order_id(self):
         self.assertEqual(
             _strategy_from_client_order_id("bk-si-uber-1778508121000-b-deadbeef"),

@@ -309,6 +309,7 @@ class MockState:
         upstream_api_key: str | None = None,
         upstream_secret_key: str | None = None,
         replay_cache_dir: str | None = None,
+        replay_step_seconds: float = 0.0,
     ) -> None:
         self.starting_cash = starting_cash
         self.cash = _decimal_value(starting_cash)
@@ -329,6 +330,7 @@ class MockState:
         self.alpaca_historical_et_date = alpaca_historical_et_date
         self.alpaca_historical_et_time = alpaca_historical_et_time
         self.replay_speed = max(0.01, float(replay_speed or 3.0))
+        self.replay_step_seconds = max(0.0, float(replay_step_seconds or 0.0))
         self.replay_wall_started_utc = _utc_now()
         self.replay_started_utc = self._initial_replay_utc()
         self.upstream_data_url = (upstream_data_url or "https://data.alpaca.markets").rstrip("/")
@@ -406,7 +408,12 @@ class MockState:
         if self.replay_started_utc is None:
             return snap_datetime_to_target_et_date(_utc_now(), self.alpaca_historical_et_date)
         elapsed = _utc_now() - self.replay_wall_started_utc
-        return self.replay_started_utc + timedelta(seconds=elapsed.total_seconds() * self.replay_speed)
+        replay_elapsed_seconds = elapsed.total_seconds() * self.replay_speed
+        if self.replay_step_seconds > 0:
+            replay_elapsed_seconds = (
+                int(replay_elapsed_seconds // self.replay_step_seconds) * self.replay_step_seconds
+            )
+        return self.replay_started_utc + timedelta(seconds=replay_elapsed_seconds)
 
     def replay_market_is_open(self) -> bool:
         if not self.market_open:
@@ -2035,6 +2042,16 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--replay-step-seconds",
+        type=float,
+        default=env_float("ALPACA_MOCK_REPLAY_STEP_SECONDS", 0.0),
+        metavar="SECONDS",
+        help=(
+            "Optional replay-time grid snapping for historical replay "
+            "(env ALPACA_MOCK_REPLAY_STEP_SECONDS). Example: 30 snaps replay now to 30-second boundaries."
+        ),
+    )
+    p.add_argument(
         "--upstream-trading-url",
         type=str,
         default=env_str("ALPACA_UPSTREAM_TRADING_URL", "https://paper-api.alpaca.markets")
@@ -2087,6 +2104,8 @@ def main() -> None:
         args.verbose = True
     if args.replay_speed is None or args.replay_speed <= 0:
         p.error("--replay-speed must be greater than 0")
+    if args.replay_step_seconds is None or args.replay_step_seconds < 0:
+        p.error("--replay-step-seconds must be zero or greater")
     for part in env_str("ALPACA_MOCK_PRICE").split(","):
         piece = part.strip()
         if "=" in piece:
@@ -2123,6 +2142,7 @@ def main() -> None:
         upstream_api_key=str(args.upstream_api_key).strip() or None,
         upstream_secret_key=str(args.upstream_secret_key).strip() or None,
         replay_cache_dir=str(args.replay_cache_dir).strip() or None,
+        replay_step_seconds=args.replay_step_seconds,
     )
     for item in args.price:
         if "=" not in item:
@@ -2160,6 +2180,7 @@ def main() -> None:
         alpaca_line = (
             f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} speed={args.replay_speed:g}x | upstream data={args.upstream_data_url.rstrip('/')}\n"
             f"  Replay cache: {str(args.replay_cache_dir).strip() or 'off'}\n"
+            f"  Replay step: {args.replay_step_seconds:g}s\n"
             f"{weekend_note}"
         )
     print(
