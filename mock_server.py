@@ -133,6 +133,7 @@ _MAX_CHART_TRACKED_SYMBOLS = 100
 _MAX_TRADE_EVENTS = 5000
 _DEFAULT_REPLAY_CACHE_DIR = "/tmp/alpaca_mock_replay_cache"
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_WS_MAX_MSGPACK_FRAME_BYTES = 512 * 1024
 _STREAM_CHANNELS = ("trades", "quotes", "bars", "updatedBars", "dailyBars", "statuses", "lulds", "news")
 
 
@@ -1922,7 +1923,17 @@ class DataHandler(BaseHTTPRequestHandler):
     def _send_ws_msgpack(self, messages: list[dict[str, Any]]) -> None:
         if msgpack is None:
             raise RuntimeError("msgpack is required for websocket stream mode")
-        self._send_ws_frame(msgpack.packb(messages, use_bin_type=True), opcode=2)
+        batch: list[dict[str, Any]] = []
+        for message in messages:
+            candidate = [*batch, message]
+            payload = msgpack.packb(candidate, use_bin_type=True)
+            if batch and len(payload) > _WS_MAX_MSGPACK_FRAME_BYTES:
+                self._send_ws_frame(msgpack.packb(batch, use_bin_type=True), opcode=2)
+                batch = [message]
+                continue
+            batch = candidate
+        if batch:
+            self._send_ws_frame(msgpack.packb(batch, use_bin_type=True), opcode=2)
 
     def _recv_exact(self, n: int) -> bytes:
         chunks: list[bytes] = []
