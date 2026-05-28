@@ -65,10 +65,13 @@ Run (Alpaca-backed replay; keys typically in ``.env``)::
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
 import re
+import socket
+import struct
 import sys
 import threading
 import uuid
@@ -85,6 +88,7 @@ from historical_proxy import (
     flatten_passthrough_params,
     proxy_quotes_latest,
     proxy_stock_bars,
+    proxy_stock_trades,
     replay_session_minutes,
     snap_datetime_to_target_et_date,
     upstream_get_json,
@@ -100,6 +104,10 @@ from mock_env import (
 
 log = logging.getLogger("alpaca_mock")
 _NY = ZoneInfo("America/New_York")
+try:
+    import msgpack  # type: ignore
+except Exception:  # pragma: no cover - defensive; stream mode reports a clear 503 below
+    msgpack = None
 
 # Paths reachable from stocktrader main.py (see module docstring).
 _MAIN_TRADING_GET_PATHS = frozenset(
@@ -124,6 +132,8 @@ _ORDER_PREFIX_STRATEGIES = {
 _MAX_CHART_TRACKED_SYMBOLS = 100
 _MAX_TRADE_EVENTS = 5000
 _DEFAULT_REPLAY_CACHE_DIR = "/tmp/alpaca_mock_replay_cache"
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_STREAM_CHANNELS = ("trades", "quotes", "bars", "updatedBars", "dailyBars", "statuses", "lulds", "news")
 
 
 def _utc_now() -> datetime:
@@ -149,6 +159,15 @@ def _parse_iso(s: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _msgpack_timestamp(dt: datetime):
+    if msgpack is None:
+        raise RuntimeError("msgpack is required for websocket stream mode")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    ns = int(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
+    return msgpack.Timestamp.from_unix_nano(ns)
 
 
 def _parse_hhmm(value: str | None) -> time_of_day | None:
@@ -812,6 +831,85 @@ def _synthetic_quote_from_mid(state: MockState, sym: str) -> dict[str, Any]:
         "bs": 100.0,
         "as": 100.0,
     }
+
+
+def _row_dt(row: dict[str, Any]) -> datetime | None:
+    return _parse_iso(str(row.get("t") or ""))
+
+
+def _stream_quote_msg(symbol: str, row: dict[str, Any]) -> dict[str, Any] | None:
+    dt = _row_dt(row)
+    if dt is None:
+        return None
+    try:
+        bp = float(row.get("bp") or row.get("bid_price") or row.get("bid") or 0)
+        ap = float(row.get("ap") or row.get("ask_price") or row.get("ask") or 0)
+    except (TypeError, ValueError):
+        return None
+    if bp <= 0 or ap <= 0:
+        return None
+    return {
+        "T": "q",
+        "S": symbol.upper(),
+        "t": _msgpack_timestamp(dt),
+        "bp": bp,
+        "ap": ap,
+        "bs": int(float(row.get("bs") or row.get("bid_size") or 100)),
+        "as": int(float(row.get("as") or row.get("ask_size") or 100)),
+    }
+
+
+def _stream_trade_msg(symbol: str, row: dict[str, Any], index: int) -> dict[str, Any] | None:
+    dt = _row_dt(row)
+    if dt is None:
+        return None
+    try:
+        price = float(row.get("p") or row.get("price") or 0)
+        size = int(float(row.get("s") or row.get("size") or 0))
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or size <= 0:
+        return None
+    return {
+        "T": "t",
+        "S": symbol.upper(),
+        "t": _msgpack_timestamp(dt),
+        "i": int(row.get("i") or row.get("id") or index),
+        "x": str(row.get("x") or "V"),
+        "p": price,
+        "s": size,
+        "c": row.get("c") if isinstance(row.get("c"), list) else [],
+        "z": str(row.get("z") or "C"),
+    }
+
+
+def _stream_bar_msg(symbol: str, row: dict[str, Any]) -> dict[str, Any] | None:
+    dt = _row_dt(row)
+    if dt is None:
+        return None
+    try:
+        close = float(row.get("c") or 0)
+        return {
+            "T": "b",
+            "S": symbol.upper(),
+            "t": _msgpack_timestamp(dt),
+            "o": float(row.get("o") or close),
+            "h": float(row.get("h") or close),
+            "l": float(row.get("l") or close),
+            "c": close,
+            "v": float(row.get("v") or row.get("volume") or 0),
+            "n": int(float(row.get("n") or 0)),
+            "vw": float(row.get("vw") or row.get("vwap") or close),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _ws_accept_value(key: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha1((key.strip() + _WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
 
 
 def _backfill_replay_latest_quotes(state: MockState, qs: dict[str, list[str]], body: dict[str, Any]) -> None:
@@ -1769,6 +1867,7 @@ class TradingHandler(BaseHTTPRequestHandler):
 
 
 class DataHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     state: MockState
     log_verbose: bool = False
     access_log: bool = False
@@ -1809,10 +1908,276 @@ class DataHandler(BaseHTTPRequestHandler):
                 _summary_data(urlparse(self.path).path, code, {"_html": True}, self.state),
             )
 
+    def _send_ws_frame(self, payload: bytes, opcode: int = 2) -> None:
+        header = bytearray([0x80 | (opcode & 0x0F)])
+        n = len(payload)
+        if n < 126:
+            header.append(n)
+        elif n <= 0xFFFF:
+            header.extend((126, *struct.pack("!H", n)))
+        else:
+            header.extend((127, *struct.pack("!Q", n)))
+        self.connection.sendall(bytes(header) + payload)
+
+    def _send_ws_msgpack(self, messages: list[dict[str, Any]]) -> None:
+        if msgpack is None:
+            raise RuntimeError("msgpack is required for websocket stream mode")
+        self._send_ws_frame(msgpack.packb(messages, use_bin_type=True), opcode=2)
+
+    def _recv_exact(self, n: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = n
+        while remaining > 0:
+            chunk = self.connection.recv(remaining)
+            if not chunk:
+                raise ConnectionError("websocket closed")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _recv_ws_message(self) -> tuple[int, bytes]:
+        chunks: list[bytes] = []
+        opcode0 = 0
+        while True:
+            h = self._recv_exact(2)
+            b0, b1 = h[0], h[1]
+            fin = bool(b0 & 0x80)
+            opcode = b0 & 0x0F
+            masked = bool(b1 & 0x80)
+            ln = b1 & 0x7F
+            if ln == 126:
+                ln = struct.unpack("!H", self._recv_exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", self._recv_exact(8))[0]
+            mask = self._recv_exact(4) if masked else b""
+            payload = self._recv_exact(ln) if ln else b""
+            if masked and payload:
+                payload = bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload))
+            if opcode == 8:
+                return opcode, payload
+            if opcode in (9, 10):
+                if opcode == 9:
+                    self._send_ws_frame(payload, opcode=10)
+                continue
+            if opcode != 0:
+                opcode0 = opcode
+            chunks.append(payload)
+            if fin:
+                return opcode0, b"".join(chunks)
+
+    def _ws_send_subscription(self, subscriptions: dict[str, set[str]]) -> None:
+        self._send_ws_msgpack(
+            [
+                {
+                    "T": "subscription",
+                    **{channel: sorted(symbols) for channel, symbols in subscriptions.items() if symbols},
+                }
+            ]
+        )
+
+    def _ws_stream_messages(
+        self,
+        subscriptions: dict[str, set[str]],
+        last_emit_utc: datetime,
+        last_bar_t: dict[str, str],
+    ) -> tuple[list[dict[str, Any]], datetime]:
+        st = self.state
+        st.refresh_replay_clock_from_wall()
+        now = st.replay_now_utc()
+        if now <= last_emit_utc:
+            return [], last_emit_utc
+        messages: list[dict[str, Any]] = []
+
+        quote_symbols = sorted(subscriptions.get("quotes", set()))
+        if quote_symbols:
+            if st.alpaca_historical_et_date and st.upstream_api_key and st.upstream_secret_key:
+                code, body = proxy_quotes_latest(
+                    {"symbols": [",".join(quote_symbols)]},
+                    st.alpaca_historical_et_date,
+                    st.upstream_data_url,
+                    st.upstream_api_key,
+                    st.upstream_secret_key,
+                    now,
+                    st.replay_cache_dir,
+                )
+                if code == 200 and isinstance(body, dict):
+                    _backfill_replay_latest_quotes(st, {"symbols": [",".join(quote_symbols)]}, body)
+                    st.remember_market_data(body)
+                    quotes = body.get("quotes") if isinstance(body.get("quotes"), dict) else {}
+                    for sym in quote_symbols:
+                        row = quotes.get(sym)
+                        if isinstance(row, dict):
+                            msg = _stream_quote_msg(sym, row)
+                            if msg:
+                                messages.append(msg)
+            else:
+                for sym in quote_symbols:
+                    t, mid, spread = st.next_quote(sym)
+                    row = {"t": t, "bp": mid - spread / 2, "ap": mid + spread / 2, "bs": 100, "as": 100}
+                    msg = _stream_quote_msg(sym, row)
+                    if msg:
+                        messages.append(msg)
+
+        trade_symbols = sorted(subscriptions.get("trades", set()))
+        if trade_symbols:
+            if st.alpaca_historical_et_date and st.upstream_api_key and st.upstream_secret_key:
+                code, body = proxy_stock_trades(
+                    {
+                        "symbols": [",".join(trade_symbols)],
+                        "start": [_iso(last_emit_utc)],
+                        "end": [_iso(now)],
+                        "limit": ["10000"],
+                        "sort": ["asc"],
+                    },
+                    st.alpaca_historical_et_date,
+                    st.upstream_data_url,
+                    st.upstream_api_key,
+                    st.upstream_secret_key,
+                    now,
+                    st.replay_cache_dir,
+                )
+                if code == 200 and isinstance(body, dict):
+                    trades = body.get("trades") if isinstance(body.get("trades"), dict) else {}
+                    for sym in trade_symbols:
+                        rows = trades.get(sym) if isinstance(trades, dict) else None
+                        if not isinstance(rows, list):
+                            continue
+                        for idx, row in enumerate(rows):
+                            if isinstance(row, dict):
+                                msg = _stream_trade_msg(sym, row, idx)
+                                if msg:
+                                    messages.append(msg)
+            else:
+                for idx, sym in enumerate(trade_symbols):
+                    mid = st.mid_price(sym, now)
+                    phase = int(now.timestamp()) % 6
+                    price = mid * (1.0004 if phase in (0, 1, 2, 3) else 0.9997)
+                    row = {"t": _iso(now), "p": price, "s": 100 + phase * 20, "i": idx + int(now.timestamp())}
+                    msg = _stream_trade_msg(sym, row, idx)
+                    if msg:
+                        messages.append(msg)
+
+        bar_symbols = sorted(subscriptions.get("bars", set()))
+        if bar_symbols:
+            start = last_emit_utc - timedelta(minutes=1)
+            qs = {
+                "symbols": [",".join(bar_symbols)],
+                "timeframe": ["1Min"],
+                "start": [_iso(start)],
+                "end": [_iso(now)],
+                "limit": ["10000"],
+            }
+            if st.alpaca_historical_et_date and st.upstream_api_key and st.upstream_secret_key:
+                code, body = proxy_stock_bars(
+                    qs,
+                    st.alpaca_historical_et_date,
+                    st.upstream_data_url,
+                    st.upstream_api_key,
+                    st.upstream_secret_key,
+                    now,
+                    st.replay_cache_dir,
+                )
+                bars = body.get("bars") if code == 200 and isinstance(body, dict) and isinstance(body.get("bars"), dict) else {}
+                if bars:
+                    st.remember_market_data({"bars": bars})
+            else:
+                bars = _synthetic_bars(bar_symbols, "1Min", start, now, 10000, st)
+            for sym in bar_symbols:
+                rows = bars.get(sym) if isinstance(bars, dict) else None
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    t_raw = str(row.get("t") or "")
+                    if not t_raw or t_raw <= last_bar_t.get(sym, ""):
+                        continue
+                    msg = _stream_bar_msg(sym, row)
+                    if msg:
+                        messages.append(msg)
+                        last_bar_t[sym] = t_raw
+
+        messages.sort(key=lambda item: str(item.get("t", "")))
+        return messages, now
+
+    def _handle_websocket(self) -> None:
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self.send_error(400, "missing Sec-WebSocket-Key")
+            return
+        if msgpack is None:
+            self.send_error(503, "msgpack is required for websocket stream mode")
+            return
+        self.state.record_tracked_symbols([])
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", _ws_accept_value(key))
+        self.end_headers()
+        self.close_connection = True
+
+        subscriptions: dict[str, set[str]] = {channel: set() for channel in _STREAM_CHANNELS}
+        last_emit_utc = self.state.replay_now_utc() - timedelta(seconds=1)
+        last_bar_t: dict[str, str] = {}
+        authenticated = False
+        self.connection.settimeout(1.0)
+        try:
+            self._send_ws_msgpack([{"T": "success", "msg": "connected"}])
+            while True:
+                try:
+                    opcode, payload = self._recv_ws_message()
+                except socket.timeout:
+                    if authenticated:
+                        messages, last_emit_utc = self._ws_stream_messages(subscriptions, last_emit_utc, last_bar_t)
+                        if messages:
+                            self.state.record_tracked_symbols(
+                                [str(msg.get("S") or "") for msg in messages if msg.get("S")]
+                            )
+                            self._send_ws_msgpack(messages)
+                    continue
+                if opcode == 8:
+                    break
+                if opcode not in (1, 2) or not payload:
+                    continue
+                raw = msgpack.unpackb(payload, raw=False)
+                if not isinstance(raw, dict):
+                    continue
+                action = str(raw.get("action") or "").lower()
+                if action == "auth":
+                    authenticated = True
+                    self._send_ws_msgpack([{"T": "success", "msg": "authenticated"}])
+                    continue
+                if action == "subscribe":
+                    for channel in _STREAM_CHANNELS:
+                        vals = raw.get(channel)
+                        if isinstance(vals, str):
+                            vals = [vals]
+                        if isinstance(vals, list):
+                            subscriptions[channel].update(str(v).strip().upper() for v in vals if str(v).strip())
+                    self._ws_send_subscription(subscriptions)
+                    continue
+                if action == "unsubscribe":
+                    for channel in _STREAM_CHANNELS:
+                        vals = raw.get(channel)
+                        if isinstance(vals, str):
+                            vals = [vals]
+                        if isinstance(vals, list):
+                            for val in vals:
+                                subscriptions[channel].discard(str(val).strip().upper())
+                    self._ws_send_subscription(subscriptions)
+        except (ConnectionError, OSError):
+            return
+        except Exception:
+            log.exception("websocket stream handler failed")
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
+
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            self._handle_websocket()
+            return
 
         if path == "/v1/mock/status":
             st = self.state
@@ -1835,6 +2200,11 @@ class DataHandler(BaseHTTPRequestHandler):
                     else None,
                     "replay_speed": st.replay_speed,
                     "upstream_data_url": st.upstream_data_url if st.alpaca_historical_et_date else None,
+                    "websocket_stream": {
+                        "enabled": msgpack is not None,
+                        "requires_msgpack": True,
+                        "paths": ["/v2/iex", "/v2/sip"],
+                    },
                     "synthetic_timestamp_utc": syn,
                     "market_open_flag": st.replay_market_is_open(),
                     "quote_tick_index": st.quote_tick_index,
@@ -2202,6 +2572,7 @@ def main() -> None:
         f"           POST /v2/orders   DELETE /v2/orders/{{id}}\n"
         f"  Data:    http://{args.host}:{args.data_port}\n"
         f"           GET /v2/stocks/quotes/latest   GET /v2/stocks/bars (rest mode only)\n"
+        f"           WS  ws://{args.host}:{args.data_port}/v2/iex or /v2/sip (quotes/trades/bars)\n"
         f"           GET /chart  GET /v1/mock/chart-series  GET /v1/mock/status\n"
         f"{alpaca_line}"
         + (

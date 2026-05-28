@@ -1,6 +1,6 @@
 # alpaca_mock_server
 
-Local HTTP mock of the Alpaca REST endpoints used by **stocktrader** (`stocktrader/main.py` via alpaca-py). WebSocket market data is not implemented here.
+Local mock of the Alpaca REST endpoints used by **stocktrader** (`stocktrader/main.py` via alpaca-py), plus a minimal Alpaca-compatible stock-data WebSocket on the data port for replaying bars, quotes, and trades.
 
 ## `.env` file
 
@@ -13,7 +13,7 @@ See **`env.example`** for supported variable names (`ALPACA_MOCK_*`, `ALPACA_UPS
 ## Modes
 
 **Alpaca historical replay (`--alpaca-date` or `ALPACA_MOCK_ALPACA_DATE` in `.env`)**  
-The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. By default the replay clock starts at `09:30` New York time and advances with server runtime; override the start time with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2026-05-13 --alpaca-time 09:35`). Use `--replay-speed N` or `ALPACA_MOCK_REPLAY_SPEED=N` to advance the replay clock faster than wall time without changing market data values; for example `--replay-speed 3` advances three replay seconds per real second. Add `--replay-step-seconds N` or `ALPACA_MOCK_REPLAY_STEP_SECONDS=N` to snap replay time onto a fixed replay-time grid, such as 30-second boundaries. Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock). Successful upstream bars/quotes are cached on disk by default at `/tmp/alpaca_mock_replay_cache`; override with `--replay-cache-dir PATH` / `ALPACA_MOCK_REPLAY_CACHE_DIR=PATH`, or set it to `off` to disable caching. For `quotes/latest`, historical upstream data can omit a symbol or return unusable bid/ask; the mock then fills that symbol with a tight synthetic NBBO from the **last known mid** (from upstream bars/quotes once seen, else optional `--price` / default `100`), so REST clients always receive a valid quote row per requested ticker.
+The data port proxies `GET /v2/stocks/bars` and `GET /v2/stocks/quotes/latest` to Alpaca’s Data API, snapping runtime request times onto that US/Eastern calendar day. The same data port also accepts Alpaca SDK WebSocket connections when `ALPACA_STREAM_URL=ws://127.0.0.1:<data-port>/v2/iex` (or `/v2/sip`) is set in stocktrader; subscribed quotes, trades, and bars are replayed from historical REST windows using the mock replay clock. By default the replay clock starts at `09:30` New York time and advances with server runtime; override the start time with `--alpaca-time HH:MM` or `ALPACA_MOCK_ALPACA_TIME=HH:MM` (for example `--alpaca-date 2026-05-13 --alpaca-time 09:35`). Use `--replay-speed N` or `ALPACA_MOCK_REPLAY_SPEED=N` to advance the replay clock faster than wall time without changing market data values; for example `--replay-speed 3` advances three replay seconds per real second. Add `--replay-step-seconds N` or `ALPACA_MOCK_REPLAY_STEP_SECONDS=N` to snap replay time onto a fixed replay-time grid, such as 30-second boundaries. Requires `ALPACA_UPSTREAM_API_KEY` and `ALPACA_UPSTREAM_SECRET_KEY` (real keys; not the dummy `test` keys used by stocktrader toward the mock). Successful upstream bars/quotes/trades are cached on disk by default at `/tmp/alpaca_mock_replay_cache`; override with `--replay-cache-dir PATH` / `ALPACA_MOCK_REPLAY_CACHE_DIR=PATH`, or set it to `off` to disable caching. For `quotes/latest`, historical upstream data can omit a symbol or return unusable bid/ask; the mock then fills that symbol with a tight synthetic NBBO from the **last known mid** (from upstream bars/quotes once seen, else optional `--price` / default `100`), so REST clients always receive a valid quote row per requested ticker.
 
 For **bars**, requests that send `end` and `limit` without `start` are mapped upstream using the same **limit-sized** window as live Alpaca (not a fixed small bar count), so clients like stocktrader do not need different warmup parameters under replay.
 
@@ -41,6 +41,12 @@ Other flags/env vars are **not** used to fake market prices in normal replay, bu
 
 ## Run
 
+Install the mock server dependency before using stream replay:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 For **historical replay**, the important flags are **`--alpaca-date`** (which US/Eastern calendar day to replay) and **`--alpaca-time`** (where the replay clock starts on that day; default `09:30` if omitted). Upstream Alpaca credentials must be set (`ALPACA_UPSTREAM_API_KEY` / `ALPACA_UPSTREAM_SECRET_KEY` in `.env` or the matching CLI flags).
 
 ```bash
@@ -59,6 +65,7 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 
 - `ALPACA_TRADING_BASE_URL=http://127.0.0.1:19901`
 - `ALPACA_DATA_BASE_URL=http://127.0.0.1:19902`
+- `ALPACA_STREAM_URL=ws://127.0.0.1:19902/v2/iex` when stocktrader stream mode is enabled
 - `ALPACA_API_KEY=test`
 - `ALPACA_SECRET_KEY=test`
 - `REPLAY_MARKET_DATA=true` when you want stocktrader’s replay timing tied to the mock clock instead of wall clock (see stocktrader docs).
@@ -75,6 +82,7 @@ Set (see stocktrader `config.py` / `alpaca_client.py`):
 
 - `GET /v2/stocks/quotes/latest`
 - `GET /v2/stocks/bars` (when `ALPACA_MARKET_DATA_MODE=rest`)
+- WebSocket `ws://127.0.0.1:<data-port>/v2/iex` or `/v2/sip` for Alpaca SDK stock stream `trades`, `quotes`, and `bars` subscriptions
 - `GET /chart` — browser chart (Chart.js) polling `GET /v1/mock/chart-series`; see **Browser chart** below
 - Optional passthrough: send header `X-Alpaca-Mock-Replay: passthrough` on bars or quotes requests to forward query params to Alpaca without replay date remapping (still requires upstream keys)
 

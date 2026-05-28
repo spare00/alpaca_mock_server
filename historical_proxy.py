@@ -487,6 +487,65 @@ def proxy_quotes_latest(
     return 200, {"quotes": out}
 
 
+def proxy_stock_trades(
+    parsed_qs: dict[str, list[str]],
+    target: date,
+    base_url: str,
+    api_key: str,
+    secret_key: str,
+    replay_now_utc: datetime | None = None,
+    cache_dir: str | Path | None = None,
+) -> tuple[int, Any]:
+    symbols_raw = (_first(parsed_qs, "symbols") or "").split(",")
+    symbols = [s.strip().upper() for s in symbols_raw if s.strip()]
+    if not symbols:
+        return 400, {"message": "missing symbols"}
+    feed = _first(parsed_qs, "feed") or "iex"
+    end_s = _first(parsed_qs, "end")
+    start_s = _first(parsed_qs, "start")
+    end_dt = parse_iso_utc(end_s) if end_s else None
+    start_dt = parse_iso_utc(start_s) if start_s else None
+    if end_dt is None:
+        end_dt = replay_now_utc or snap_datetime_to_target_et_date(_utc_now(), target)
+    if start_dt is None:
+        start_dt = end_dt - timedelta(seconds=5)
+    if start_dt >= end_dt:
+        start_dt = end_dt - timedelta(seconds=1)
+
+    out: dict[str, list[Any]] = {}
+    chunk_size = 50
+    for i in range(0, len(symbols), chunk_size):
+        chunk = symbols[i : i + chunk_size]
+        params = {
+            "symbols": ",".join(chunk),
+            "start": _iso_z(start_dt),
+            "end": _iso_z(end_dt),
+            "limit": _first(parsed_qs, "limit") or "10000",
+            "sort": _first(parsed_qs, "sort") or "asc",
+            "feed": feed,
+        }
+        status, body, _ = _cached_upstream_get_json(
+            cache_dir,
+            "/v2/stocks/trades",
+            target,
+            base_url,
+            params,
+            api_key,
+            secret_key,
+            timeout=90.0,
+        )
+        if status != 200 or not isinstance(body, dict):
+            continue
+        trades = body.get("trades") or {}
+        if not isinstance(trades, dict):
+            continue
+        for sym in chunk:
+            rows = trades.get(sym) or trades.get(sym.upper()) or []
+            if isinstance(rows, list):
+                out[sym] = rows
+    return 200, {"trades": out, "next_page_token": None}
+
+
 def replay_session_minutes(target: date, now_utc: datetime | None = None) -> float:
     """Minutes since 09:30 US/Eastern on ``target`` for a wall-snapped instant (for /v1/mock/status)."""
     now_utc = now_utc or _utc_now()

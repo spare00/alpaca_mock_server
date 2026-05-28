@@ -8,7 +8,7 @@ from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from historical_proxy import _flatten_upstream_params, proxy_quotes_latest, proxy_stock_bars
+from historical_proxy import _flatten_upstream_params, proxy_quotes_latest, proxy_stock_bars, proxy_stock_trades
 
 
 class HistoricalProxyTests(unittest.TestCase):
@@ -87,6 +87,25 @@ class HistoricalProxyTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     proxy_quotes_latest(qs, date(2026, 5, 14), "https://example.test", "k", "s", replay_now, tmp),
+                    (200, expected),
+                )
+
+        self.assertEqual(upstream.call_count, 1)
+
+    def test_stock_trades_replay_cache_reuses_successful_response(self):
+        replay_now = datetime(2026, 5, 14, 13, 35, 16, tzinfo=timezone.utc)
+        qs = parse_qs("symbols=AAPL&start=2026-05-14T13:35:00Z&end=2026-05-14T13:35:16Z&feed=iex")
+        body = {"trades": {"AAPL": [{"t": "2026-05-14T13:35:10Z", "p": 10.0, "s": 100}]}}
+        expected = {"trades": {"AAPL": body["trades"]["AAPL"]}, "next_page_token": None}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("historical_proxy.upstream_get_json", return_value=(200, body, "")) as upstream:
+                self.assertEqual(
+                    proxy_stock_trades(qs, date(2026, 5, 14), "https://example.test", "k", "s", replay_now, tmp),
+                    (200, expected),
+                )
+                self.assertEqual(
+                    proxy_stock_trades(qs, date(2026, 5, 14), "https://example.test", "k", "s", replay_now, tmp),
                     (200, expected),
                 )
 
