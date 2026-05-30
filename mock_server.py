@@ -86,11 +86,15 @@ from zoneinfo import ZoneInfo
 
 from historical_proxy import (
     flatten_passthrough_params,
+    is_trading_day,
+    iter_trading_days,
+    map_replay_elapsed_to_utc,
     proxy_quotes_latest,
     proxy_stock_bars,
     proxy_stock_trades,
     replay_session_minutes,
     snap_datetime_to_target_et_date,
+    total_replay_session_seconds,
     upstream_get_json,
 )
 from mock_env import (
@@ -332,6 +336,7 @@ class MockState:
         market_open: bool,
         *,
         alpaca_historical_et_date: date | None = None,
+        alpaca_historical_et_end_date: date | None = None,
         alpaca_historical_et_time: time_of_day | None = None,
         replay_speed: float = 3.0,
         upstream_data_url: str = "https://data.alpaca.markets",
@@ -358,6 +363,7 @@ class MockState:
         self.quote_lock = threading.Lock()
         self.quote_last_emit_utc: datetime | None = None
         self.alpaca_historical_et_date = alpaca_historical_et_date
+        self.alpaca_historical_et_end_date = alpaca_historical_et_end_date or alpaca_historical_et_date
         self.alpaca_historical_et_time = alpaca_historical_et_time
         self.replay_speed = max(0.01, float(replay_speed or 3.0))
         self.replay_step_seconds = max(0.0, float(replay_step_seconds or 0.0))
@@ -419,31 +425,46 @@ class MockState:
     def _initial_replay_utc(self) -> datetime | None:
         if self.alpaca_historical_et_date is None:
             return None
-        if self.alpaca_historical_et_time is not None:
-            return datetime.combine(
-                self.alpaca_historical_et_date,
-                self.alpaca_historical_et_time,
-                tzinfo=_NY,
-            ).astimezone(timezone.utc)
-        return snap_datetime_to_target_et_date(self.replay_wall_started_utc, self.alpaca_historical_et_date)
+        start_time = self.alpaca_historical_et_time or time_of_day(9, 30)
+        return map_replay_elapsed_to_utc(
+            self.alpaca_historical_et_date,
+            self.alpaca_historical_et_end_date or self.alpaca_historical_et_date,
+            start_time,
+            0.0,
+        )
+
+    def replay_target_et_date(self) -> date:
+        return self.replay_now_utc().astimezone(_NY).date()
 
     def refresh_replay_clock_from_wall(self) -> None:
         if self.alpaca_historical_et_date is None:
             return
-        self.sim_session_minutes = replay_session_minutes(self.alpaca_historical_et_date, self.replay_now_utc())
+        self.sim_session_minutes = replay_session_minutes(None, self.replay_now_utc())
 
     def replay_now_utc(self) -> datetime:
         if self.alpaca_historical_et_date is None:
             return _utc_now()
+        end_date = self.alpaca_historical_et_end_date or self.alpaca_historical_et_date
+        start_time = self.alpaca_historical_et_time or time_of_day(9, 30)
         if self.replay_started_utc is None:
-            return snap_datetime_to_target_et_date(_utc_now(), self.alpaca_historical_et_date)
+            return map_replay_elapsed_to_utc(
+                self.alpaca_historical_et_date,
+                end_date,
+                start_time,
+                0.0,
+            )
         elapsed = _utc_now() - self.replay_wall_started_utc
         replay_elapsed_seconds = elapsed.total_seconds() * self.replay_speed
         if self.replay_step_seconds > 0:
             replay_elapsed_seconds = (
                 int(replay_elapsed_seconds // self.replay_step_seconds) * self.replay_step_seconds
             )
-        return self.replay_started_utc + timedelta(seconds=replay_elapsed_seconds)
+        return map_replay_elapsed_to_utc(
+            self.alpaca_historical_et_date,
+            end_date,
+            start_time,
+            replay_elapsed_seconds,
+        )
 
     def replay_market_is_open(self) -> bool:
         if not self.market_open:
@@ -453,7 +474,7 @@ class MockState:
         # Alpaca has no regular US equity session on weekends. Exchange holidays
         # are still delegated to upstream data availability.
         replay_et = self.replay_now_utc().astimezone(_NY)
-        return replay_et.weekday() < 5 and time_of_day(9, 30) <= replay_et.time() < time_of_day(16, 0)
+        return is_trading_day(replay_et.date()) and time_of_day(9, 30) <= replay_et.time() < time_of_day(16, 0)
 
     def next_quote(self, symbol: str) -> tuple[str, float, float]:
         """Synthetic quote: monotonic UTC ``t``, mid, half-spread width (bps-sized)."""
@@ -1112,7 +1133,7 @@ def _mock_chart_series(state: MockState, qs: dict[str, list[str]]) -> tuple[int,
     ):
         code, body = proxy_stock_bars(
             bar_qs,
-            state.alpaca_historical_et_date,
+            state.replay_target_et_date(),
             state.upstream_data_url,
             state.upstream_api_key,
             state.upstream_secret_key,
@@ -1815,7 +1836,7 @@ class TradingHandler(BaseHTTPRequestHandler):
         ):
             code, quote_body = proxy_quotes_latest(
                 {"symbols": [sym]},
-                self.state.alpaca_historical_et_date,
+                self.state.replay_target_et_date(),
                 self.state.upstream_data_url,
                 self.state.upstream_api_key,
                 self.state.upstream_secret_key,
@@ -2004,7 +2025,7 @@ class DataHandler(BaseHTTPRequestHandler):
             if st.alpaca_historical_et_date and st.upstream_api_key and st.upstream_secret_key:
                 code, body = proxy_quotes_latest(
                     {"symbols": [",".join(quote_symbols)]},
-                    st.alpaca_historical_et_date,
+                    st.replay_target_et_date(),
                     st.upstream_data_url,
                     st.upstream_api_key,
                     st.upstream_secret_key,
@@ -2040,7 +2061,7 @@ class DataHandler(BaseHTTPRequestHandler):
                         "limit": ["10000"],
                         "sort": ["asc"],
                     },
-                    st.alpaca_historical_et_date,
+                    st.replay_target_et_date(),
                     st.upstream_data_url,
                     st.upstream_api_key,
                     st.upstream_secret_key,
@@ -2081,7 +2102,7 @@ class DataHandler(BaseHTTPRequestHandler):
             if st.alpaca_historical_et_date and st.upstream_api_key and st.upstream_secret_key:
                 code, body = proxy_stock_bars(
                     qs,
-                    st.alpaca_historical_et_date,
+                    st.replay_target_et_date(),
                     st.upstream_data_url,
                     st.upstream_api_key,
                     st.upstream_secret_key,
@@ -2206,6 +2227,20 @@ class DataHandler(BaseHTTPRequestHandler):
                     "alpaca_historical_et_date": str(st.alpaca_historical_et_date)
                     if st.alpaca_historical_et_date
                     else None,
+                    "alpaca_historical_et_end_date": str(st.alpaca_historical_et_end_date)
+                    if st.alpaca_historical_et_end_date
+                    else None,
+                    "replay_target_et_date": str(st.replay_target_et_date())
+                    if st.alpaca_historical_et_date
+                    else None,
+                    "replay_now_utc": syn,
+                    "replay_session_total_seconds": total_replay_session_seconds(
+                        st.alpaca_historical_et_date,
+                        st.alpaca_historical_et_end_date or st.alpaca_historical_et_date,
+                        st.alpaca_historical_et_time,
+                    )
+                    if st.alpaca_historical_et_date
+                    else None,
                     "alpaca_historical_et_time": st.alpaca_historical_et_time.strftime("%H:%M")
                     if st.alpaca_historical_et_time
                     else None,
@@ -2273,7 +2308,7 @@ class DataHandler(BaseHTTPRequestHandler):
                 self.state.refresh_replay_clock_from_wall()
                 code, body = proxy_stock_bars(
                     qs,
-                    self.state.alpaca_historical_et_date,
+                    self.state.replay_target_et_date(),
                     self.state.upstream_data_url,
                     self.state.upstream_api_key,
                     self.state.upstream_secret_key,
@@ -2322,7 +2357,7 @@ class DataHandler(BaseHTTPRequestHandler):
                 self.state.refresh_replay_clock_from_wall()
                 code, body = proxy_quotes_latest(
                     qs,
-                    self.state.alpaca_historical_et_date,
+                    self.state.replay_target_et_date(),
                     self.state.upstream_data_url,
                     self.state.upstream_api_key,
                     self.state.upstream_secret_key,
@@ -2404,11 +2439,34 @@ def main() -> None:
     p.add_argument(
         "--alpaca-date",
         type=str,
-        default=env_str("ALPACA_MOCK_ALPACA_DATE") or env_str("ALPACA_MOCK_DATE") or None,
+        default=env_str("ALPACA_MOCK_ALPACA_DATE")
+        or env_str("ALPACA_MOCK_DATE")
+        or env_str("ALPACA_MOCK_ALPACA_START_DATE")
+        or env_str("ALPACA_MOCK_START_DATE")
+        or None,
         metavar="YYYY-MM-DD",
         help=(
-            "Replay calendar day (US/Eastern): forward /v2/stocks/bars and /v2/stocks/quotes/latest to Alpaca's "
-            "data API with request times snapped onto this date. Requires upstream credentials (not the mock client keys)."
+            "Replay start calendar day (US/Eastern): forward /v2/stocks/bars and /v2/stocks/quotes/latest to Alpaca's "
+            "data API with request times snapped onto the active replay day. Requires upstream credentials "
+            "(not the mock client keys). Alias for --alpaca-start-date."
+        ),
+    )
+    p.add_argument(
+        "--alpaca-start-date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Alias for --alpaca-date (env ALPACA_MOCK_ALPACA_START_DATE / ALPACA_MOCK_START_DATE).",
+    )
+    p.add_argument(
+        "--alpaca-end-date",
+        type=str,
+        default=env_str("ALPACA_MOCK_ALPACA_END_DATE") or env_str("ALPACA_MOCK_END_DATE") or None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Replay end calendar day (US/Eastern, inclusive). With --alpaca-date, replay advances only during "
+            "regular session hours (09:30-16:00 ET) on weekdays from start through end, skipping overnight and "
+            "weekends. Defaults to the start date when omitted."
         ),
     )
     p.add_argument(
@@ -2508,8 +2566,17 @@ def main() -> None:
         print(f"Loaded environment from {loaded_env_path}", flush=True)
 
     alpaca_hist: date | None = None
+    alpaca_hist_end: date | None = None
     alpaca_hist_time: time_of_day | None = None
-    if args.alpaca_date and str(args.alpaca_date).strip():
+    start_raw = (
+        str(args.alpaca_start_date).strip()
+        if args.alpaca_start_date and str(args.alpaca_start_date).strip()
+        else str(args.alpaca_date).strip()
+        if args.alpaca_date and str(args.alpaca_date).strip()
+        else ""
+    )
+    end_raw = str(args.alpaca_end_date).strip() if args.alpaca_end_date and str(args.alpaca_end_date).strip() else ""
+    if start_raw:
         key = str(args.upstream_api_key).strip()
         sec = str(args.upstream_secret_key).strip()
         if not key or not sec:
@@ -2519,15 +2586,30 @@ def main() -> None:
                 "--upstream-api-key and --upstream-secret-key"
             )
         try:
-            alpaca_hist = date.fromisoformat(str(args.alpaca_date).strip())
+            alpaca_hist = date.fromisoformat(start_raw)
         except ValueError:
-            p.error("--alpaca-date must be YYYY-MM-DD")
+            p.error("--alpaca-date / --alpaca-start-date must be YYYY-MM-DD")
+        if end_raw:
+            try:
+                alpaca_hist_end = date.fromisoformat(end_raw)
+            except ValueError:
+                p.error("--alpaca-end-date must be YYYY-MM-DD")
+        else:
+            alpaca_hist_end = alpaca_hist
+        if alpaca_hist_end < alpaca_hist:
+            p.error("--alpaca-end-date must be on or after the start date")
+        if not iter_trading_days(alpaca_hist, alpaca_hist_end):
+            p.error(
+                "replay date range contains no weekdays (Mon–Fri); "
+                "Saturday and Sunday are excluded"
+            )
         alpaca_hist_time = args.alpaca_time or time_of_day(9, 30)
 
     state = MockState(
         args.cash,
         market_open=not args.market_closed,
         alpaca_historical_et_date=alpaca_hist,
+        alpaca_historical_et_end_date=alpaca_hist_end,
         alpaca_historical_et_time=alpaca_hist_time,
         replay_speed=args.replay_speed,
         upstream_data_url=args.upstream_data_url,
@@ -2569,9 +2651,19 @@ def main() -> None:
     if alpaca_hist:
         weekend_note = ""
         if alpaca_hist.weekday() >= 5:
-            weekend_note = "  Warning: replay date is a weekend; upstream equity data will usually be empty.\n"
+            weekend_note = "  Warning: replay start date is a weekend; upstream equity data will usually be empty.\n"
+        range_note = ""
+        if alpaca_hist_end and alpaca_hist_end != alpaca_hist:
+            session_hours = total_replay_session_seconds(alpaca_hist, alpaca_hist_end, alpaca_hist_time) / 3600.0
+            range_note = (
+                f"  Replay range: ET {alpaca_hist} .. {alpaca_hist_end} "
+                f"({session_hours:.1f} regular-session hours, weekdays only)\n"
+            )
         alpaca_line = (
-            f"  Alpaca historical replay: ET date={alpaca_hist} time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else 'wall-clock'} speed={args.replay_speed:g}x | upstream data={args.upstream_data_url.rstrip('/')}\n"
+            f"  Alpaca historical replay: ET start={alpaca_hist} end={alpaca_hist_end} "
+            f"time={alpaca_hist_time.strftime('%H:%M') if alpaca_hist_time else '09:30'} "
+            f"speed={args.replay_speed:g}x | upstream data={args.upstream_data_url.rstrip('/')}\n"
+            f"{range_note}"
             f"  Replay cache: {replay_cache_dir or 'off'}\n"
             f"  Replay step: {args.replay_step_seconds:g}s\n"
             f"{weekend_note}"

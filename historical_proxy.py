@@ -85,12 +85,93 @@ def timeframe_to_seconds(timeframe: str) -> int:
     return n * mult[unit]
 
 
+_REGULAR_OPEN_ET = time_of_day(9, 30)
+_REGULAR_CLOSE_ET = time_of_day(16, 0)
+
+
 def _et_open_utc(d: date) -> datetime:
-    return datetime.combine(d, time_of_day(9, 30), tzinfo=_NY).astimezone(timezone.utc)
+    return datetime.combine(d, _REGULAR_OPEN_ET, tzinfo=_NY).astimezone(timezone.utc)
 
 
 def _et_close_utc(d: date) -> datetime:
-    return datetime.combine(d, time_of_day(16, 0), tzinfo=_NY).astimezone(timezone.utc)
+    return datetime.combine(d, _REGULAR_CLOSE_ET, tzinfo=_NY).astimezone(timezone.utc)
+
+
+def is_trading_day(d: date) -> bool:
+    """True for Mon–Fri; Saturday and Sunday are excluded."""
+    return d.weekday() < 5
+
+
+def iter_trading_days(start: date, end: date) -> list[date]:
+    """Weekdays (Mon–Fri) from ``start`` through ``end`` inclusive; Sat/Sun skipped."""
+    if end < start:
+        return []
+    out: list[date] = []
+    d = start
+    while d <= end:
+        if is_trading_day(d):
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def _session_open_utc(session_day: date, start_time_et: time_of_day | None = None) -> datetime:
+    open_t = start_time_et or _REGULAR_OPEN_ET
+    if open_t < _REGULAR_OPEN_ET:
+        open_t = _REGULAR_OPEN_ET
+    if open_t >= _REGULAR_CLOSE_ET:
+        open_t = time_of_day(15, 59, 59)
+    return datetime.combine(session_day, open_t, tzinfo=_NY).astimezone(timezone.utc)
+
+
+def total_replay_session_seconds(
+    start_date: date,
+    end_date: date,
+    start_time_et: time_of_day | None = None,
+) -> float:
+    """Regular-session replay span from ``start_date`` through ``end_date`` (weekdays only)."""
+    total = 0.0
+    first = True
+    for session_day in iter_trading_days(start_date, end_date):
+        open_u = _session_open_utc(session_day, start_time_et if first else None)
+        close_u = _et_close_utc(session_day)
+        first = False
+        if close_u > open_u:
+            total += (close_u - open_u).total_seconds()
+    return total
+
+
+def map_replay_elapsed_to_utc(
+    start_date: date,
+    end_date: date,
+    start_time_et: time_of_day | None,
+    elapsed_seconds: float,
+) -> datetime:
+    """
+    Map replay-time seconds (regular session only) to an absolute UTC instant.
+
+    Overnight and weekends are skipped: replay advances only between 09:30 and 16:00 ET
+    on weekdays from ``start_date`` through ``end_date``. After the last session close,
+    time clamps to that close.
+    """
+    remaining = max(0.0, float(elapsed_seconds))
+    trading_days = iter_trading_days(start_date, end_date)
+    if not trading_days:
+        return _session_open_utc(start_date, start_time_et)
+
+    last_close = _et_close_utc(trading_days[-1])
+    first = True
+    for session_day in trading_days:
+        open_u = _session_open_utc(session_day, start_time_et if first else None)
+        close_u = _et_close_utc(session_day)
+        first = False
+        if close_u <= open_u:
+            continue
+        session_len = (close_u - open_u).total_seconds()
+        if remaining < session_len:
+            return open_u + timedelta(seconds=remaining)
+        remaining -= session_len
+    return last_close
 
 
 def _implied_last_session_date_et(end_utc: datetime) -> date:
@@ -546,14 +627,19 @@ def proxy_stock_trades(
     return 200, {"trades": out, "next_page_token": None}
 
 
-def replay_session_minutes(target: date, now_utc: datetime | None = None) -> float:
-    """Minutes since 09:30 US/Eastern on ``target`` for a wall-snapped instant (for /v1/mock/status)."""
+def replay_session_minutes(target: date | None, now_utc: datetime | None = None) -> float:
+    """Minutes since 09:30 US/Eastern on the replay calendar day (for /v1/mock/status)."""
     now_utc = now_utc or _utc_now()
-    snapped = snap_datetime_to_target_et_date(now_utc, target).astimezone(_NY)
-    open_et = datetime.combine(target, time_of_day(9, 30), tzinfo=_NY)
-    close_et = datetime.combine(target, time_of_day(16, 0), tzinfo=_NY)
-    if snapped < open_et:
+    if target is not None:
+        et = now_utc.astimezone(_NY)
+        if et.date() != target:
+            et = datetime.combine(target, et.time(), tzinfo=_NY)
+    else:
+        et = now_utc.astimezone(_NY)
+    open_et = datetime.combine(et.date(), _REGULAR_OPEN_ET, tzinfo=_NY)
+    close_et = datetime.combine(et.date(), _REGULAR_CLOSE_ET, tzinfo=_NY)
+    if et < open_et:
         return 0.0
-    if snapped > close_et:
+    if et > close_et:
         return (close_et - open_et).total_seconds() / 60.0
-    return max(0.0, (snapped - open_et).total_seconds() / 60.0)
+    return max(0.0, (et - open_et).total_seconds() / 60.0)

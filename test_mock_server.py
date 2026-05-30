@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import unittest
 from unittest.mock import patch
 
@@ -102,7 +102,6 @@ class MockServerTests(unittest.TestCase):
     def test_replay_clock_uses_speed_multiplier(self):
         wall_start = datetime(2026, 5, 26, 0, 0, 0, tzinfo=timezone.utc)
         wall_now = datetime(2026, 5, 26, 0, 0, 10, tzinfo=timezone.utc)
-        replay_start = datetime(2026, 5, 11, 13, 30, 0, tzinfo=timezone.utc)
         with patch.object(mock_server, "_utc_now", side_effect=[wall_start, wall_now]):
             state = MockState(
                 "100000",
@@ -110,14 +109,12 @@ class MockServerTests(unittest.TestCase):
                 alpaca_historical_et_date=date(2026, 5, 11),
                 replay_speed=3.0,
             )
-            state.replay_started_utc = replay_start
 
             self.assertEqual(state.replay_now_utc(), datetime(2026, 5, 11, 13, 30, 30, tzinfo=timezone.utc))
 
     def test_replay_clock_can_snap_to_fixed_step(self):
         wall_start = datetime(2026, 5, 26, 0, 0, 0, tzinfo=timezone.utc)
         wall_now = datetime(2026, 5, 26, 0, 0, 11, tzinfo=timezone.utc)
-        replay_start = datetime(2026, 5, 11, 13, 30, 0, tzinfo=timezone.utc)
         with patch.object(mock_server, "_utc_now", side_effect=[wall_start, wall_now]):
             state = MockState(
                 "100000",
@@ -126,9 +123,25 @@ class MockServerTests(unittest.TestCase):
                 replay_speed=3.0,
                 replay_step_seconds=30.0,
             )
-            state.replay_started_utc = replay_start
 
             self.assertEqual(state.replay_now_utc(), datetime(2026, 5, 11, 13, 30, 30, tzinfo=timezone.utc))
+
+    def test_replay_clock_advances_to_next_weekday_session(self):
+        wall_start = datetime(2026, 5, 26, 0, 0, 0, tzinfo=timezone.utc)
+        # 6.5 regular-session hours at 1x speed -> Tue 09:30 ET
+        wall_now = wall_start + timedelta(hours=6, minutes=30)
+        with patch.object(mock_server, "_utc_now", side_effect=[wall_start, wall_now, wall_now]):
+            state = MockState(
+                "100000",
+                True,
+                alpaca_historical_et_date=date(2026, 5, 18),
+                alpaca_historical_et_end_date=date(2026, 5, 22),
+                replay_speed=1.0,
+            )
+
+            replay_now = state.replay_now_utc()
+            self.assertEqual(replay_now, datetime(2026, 5, 19, 13, 30, tzinfo=timezone.utc))
+            self.assertEqual(replay_now.astimezone(mock_server._NY).date(), date(2026, 5, 19))
 
     def test_strategy_is_parsed_from_bk_client_order_id(self):
         self.assertEqual(

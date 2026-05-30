@@ -8,10 +8,59 @@ from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from historical_proxy import _flatten_upstream_params, proxy_quotes_latest, proxy_stock_bars, proxy_stock_trades
+from historical_proxy import (
+    _flatten_upstream_params,
+    is_trading_day,
+    iter_trading_days,
+    map_replay_elapsed_to_utc,
+    proxy_quotes_latest,
+    proxy_stock_bars,
+    proxy_stock_trades,
+    total_replay_session_seconds,
+)
 
 
 class HistoricalProxyTests(unittest.TestCase):
+    def test_trading_day_range_skips_weekends(self):
+        self.assertEqual(
+            iter_trading_days(date(2026, 5, 18), date(2026, 5, 22)),
+            [
+                date(2026, 5, 18),
+                date(2026, 5, 19),
+                date(2026, 5, 20),
+                date(2026, 5, 21),
+                date(2026, 5, 22),
+            ],
+        )
+        self.assertFalse(is_trading_day(date(2026, 5, 16)))  # Saturday
+        self.assertFalse(is_trading_day(date(2026, 5, 17)))  # Sunday
+
+    def test_trading_day_range_skips_weekend_in_middle(self):
+        # Fri .. Mon: Saturday/Sunday omitted.
+        self.assertEqual(
+            iter_trading_days(date(2026, 5, 15), date(2026, 5, 18)),
+            [date(2026, 5, 15), date(2026, 5, 18)],
+        )
+
+    def test_map_replay_elapsed_skips_sat_sun_after_friday_close(self):
+        elapsed = 6.5 * 3600  # full Fri regular session
+        now = map_replay_elapsed_to_utc(date(2026, 5, 15), date(2026, 5, 18), None, elapsed)
+        self.assertEqual(now.astimezone(timezone.utc), datetime(2026, 5, 18, 13, 30, tzinfo=timezone.utc))
+
+    def test_total_replay_session_seconds_counts_regular_hours_only(self):
+        total = total_replay_session_seconds(date(2026, 5, 18), date(2026, 5, 22), None)
+        self.assertEqual(total, 5 * 6.5 * 3600)
+
+    def test_map_replay_elapsed_skips_overnight_between_sessions(self):
+        # One full Mon session (6.5h) plus 30 minutes into Tue.
+        elapsed = 6.5 * 3600 + 30 * 60
+        now = map_replay_elapsed_to_utc(date(2026, 5, 18), date(2026, 5, 22), None, elapsed)
+        self.assertEqual(now.astimezone(timezone.utc), datetime(2026, 5, 19, 14, 0, tzinfo=timezone.utc))
+
+    def test_map_replay_elapsed_clamps_after_last_session_close(self):
+        now = map_replay_elapsed_to_utc(date(2026, 5, 18), date(2026, 5, 18), None, 1_000_000)
+        self.assertEqual(now.astimezone(timezone.utc), datetime(2026, 5, 18, 20, 0, tzinfo=timezone.utc))
+
     def test_session_backfill_uses_previous_session_without_lookahead(self):
         replay_now = datetime(2026, 5, 14, 13, 35, 16, tzinfo=timezone.utc)
         qs = parse_qs(
