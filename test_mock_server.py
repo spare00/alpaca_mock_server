@@ -249,5 +249,74 @@ class MockServerTests(unittest.TestCase):
         self.assertEqual([ev["fill_stage"] for ev in events], ["entry", "partial", "full"])
 
 
+class ReplayTradeQuotePairingTests(unittest.TestCase):
+    def test_quote_row_at_or_before_rejects_stale_nbbo(self):
+        rows = [
+            (datetime(2026, 5, 6, 18, 9, 4, tzinfo=timezone.utc), {"bp": 70.5, "ap": 70.52, "t": "2026-05-06T18:09:04Z"}),
+            (datetime(2026, 5, 6, 18, 9, 34, tzinfo=timezone.utc), {"bp": 70.59, "ap": 70.6, "t": "2026-05-06T18:09:34Z"}),
+        ]
+        trade_dt = datetime(2026, 5, 6, 18, 9, 35, tzinfo=timezone.utc)
+        fresh = mock_server._quote_row_at_or_before(rows, trade_dt, 2.0)
+        stale = mock_server._quote_row_at_or_before(rows, trade_dt, 0.5)
+        self.assertEqual(fresh, rows[1][1])
+        self.assertIsNone(stale)
+
+    def test_replay_paired_messages_emit_quote_before_trade(self):
+        state = MockState("100000", True, alpaca_historical_et_date=date(2026, 5, 6))
+        trade_body = {
+            "trades": {
+                "KRE": [
+                    {"t": "2026-05-06T18:09:35.100Z", "p": 70.55, "s": 100},
+                    {"t": "2026-05-06T18:09:35.200Z", "p": 70.56, "s": 120},
+                ]
+            }
+        }
+        quote_range_body = {
+            "quotes": {
+                "KRE": [
+                    {"t": "2026-05-06T18:09:34.606Z", "bp": 70.59, "ap": 70.6, "bs": 100, "as": 100},
+                    {"t": "2026-05-06T18:09:35.050Z", "bp": 70.54, "ap": 70.55, "bs": 100, "as": 100},
+                ]
+            }
+        }
+        messages, emitted = mock_server._ws_replay_paired_trade_quote_messages(
+            state,
+            ["KRE"],
+            trade_body,
+            quote_range_body,
+        )
+        self.assertEqual(emitted, {"KRE"})
+        self.assertEqual(len(messages), 3)
+        self.assertEqual([msg["T"] for msg in messages], ["q", "t", "t"])
+        sorted_messages = sorted(messages, key=mock_server._stream_message_sort_key)
+        self.assertEqual([msg["T"] for msg in sorted_messages], ["q", "t", "t"])
+
+    def test_replay_paired_messages_skip_trades_without_fresh_quote(self):
+        state = MockState("100000", True, alpaca_historical_et_date=date(2026, 5, 6))
+        trade_body = {
+            "trades": {
+                "BAC": [
+                    {"t": "2026-05-08T19:20:40.055Z", "p": 51.3, "s": 100},
+                ]
+            }
+        }
+        quote_range_body = {
+            "quotes": {
+                "BAC": [
+                    {"t": "2026-05-08T19:20:09.000Z", "bp": 51.21, "ap": 51.22, "bs": 100, "as": 100},
+                ]
+            }
+        }
+        messages, emitted = mock_server._ws_replay_paired_trade_quote_messages(
+            state,
+            ["BAC"],
+            trade_body,
+            quote_range_body,
+            max_quote_lag_seconds=2.0,
+        )
+        self.assertEqual(messages, [])
+        self.assertEqual(emitted, set())
+
+
 if __name__ == "__main__":
     unittest.main()

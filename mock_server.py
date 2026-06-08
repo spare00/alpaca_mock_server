@@ -92,6 +92,7 @@ from historical_proxy import (
     map_replay_elapsed_to_utc,
     proxy_quotes_latest,
     proxy_stock_bars,
+    proxy_stock_quotes,
     proxy_stock_trades,
     replay_session_minutes,
     snap_datetime_to_target_et_date,
@@ -123,6 +124,10 @@ _MAIN_DATA_PATHS = frozenset({"/v2/stocks/bars", "/v2/stocks/quotes/latest"})
 _TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 _PASSTHROUGH_HEADER = "X-Alpaca-Mock-Replay"
 _REPLAY_FILL_BAR_GUARD_PCT = Decimal("0.02")
+# Max age of NBBO used to classify a replay trade tick (liquidity_scalper tape pairing).
+_REPLAY_TRADE_QUOTE_MAX_LAG_SECONDS = 2.0
+# Look back before the emit window so the first trades still get a recent quote.
+_REPLAY_TRADE_QUOTE_LOOKBACK_SECONDS = 5.0
 _ORDER_PREFIX_STRATEGIES = {
     "gag": "gap_and_go",
     "mei": "macd_early_impulse",
@@ -926,6 +931,137 @@ def _stream_bar_msg(symbol: str, row: dict[str, Any]) -> dict[str, Any] | None:
         }
     except (TypeError, ValueError):
         return None
+
+
+def _stream_message_sort_key(msg: dict[str, Any]) -> tuple[int, int]:
+    """Sort stream events by time; quotes before trades at the same timestamp."""
+    raw_t = msg.get("t")
+    if isinstance(raw_t, datetime):
+        dt = raw_t.astimezone(timezone.utc)
+        ts = int(dt.timestamp() * 1_000_000_000)
+    elif hasattr(raw_t, "seconds") and hasattr(raw_t, "nanoseconds"):
+        ts = int(raw_t.seconds) * 1_000_000_000 + int(getattr(raw_t, "nanoseconds", 0) or 0)
+    elif isinstance(raw_t, str):
+        dt = _parse_iso(raw_t)
+        ts = int(dt.timestamp() * 1_000_000_000) if dt is not None else 0
+    else:
+        ts = 0
+    kind = {"q": 0, "t": 1, "b": 2}.get(str(msg.get("T") or ""), 9)
+    return ts, kind
+
+
+def _quote_rows_by_symbol(body: dict[str, Any] | None) -> dict[str, list[tuple[datetime, dict[str, Any]]]]:
+    if not isinstance(body, dict):
+        return {}
+    raw = body.get("quotes")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[tuple[datetime, dict[str, Any]]]] = {}
+    for sym, rows in raw.items():
+        if not isinstance(rows, list):
+            continue
+        parsed: list[tuple[datetime, dict[str, Any]]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            dt = _row_dt(row)
+            if dt is not None:
+                parsed.append((dt, row))
+        if parsed:
+            parsed.sort(key=lambda item: item[0])
+            out[sym.strip().upper()] = parsed
+    return out
+
+
+def _quote_row_at_or_before(
+    rows: list[tuple[datetime, dict[str, Any]]],
+    trade_dt: datetime,
+    max_lag_seconds: float,
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    trade_dt = trade_dt.astimezone(timezone.utc)
+    best: tuple[datetime, dict[str, Any]] | None = None
+    for dt, row in rows:
+        if dt > trade_dt:
+            break
+        best = (dt, row)
+    if best is None:
+        return None
+    lag = (trade_dt - best[0]).total_seconds()
+    if lag > max_lag_seconds:
+        return None
+    return best[1]
+
+
+def _remember_stream_quote(st: MockState, symbol: str, row: dict[str, Any]) -> None:
+    try:
+        bid = float(row.get("bp") or row.get("bid_price") or row.get("bid") or 0)
+        ask = float(row.get("ap") or row.get("ask_price") or row.get("ask") or 0)
+    except (TypeError, ValueError):
+        return
+    if bid > 0 and ask > 0:
+        st.remember_market_quote(symbol, bid, ask, row.get("t"))
+
+
+def _ws_replay_paired_trade_quote_messages(
+    st: MockState,
+    trade_symbols: list[str],
+    trade_body: dict[str, Any] | None,
+    quote_range_body: dict[str, Any] | None,
+    *,
+    max_quote_lag_seconds: float = _REPLAY_TRADE_QUOTE_MAX_LAG_SECONDS,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Emit quote immediately before each replay trade so tape classification sees fresh NBBO."""
+    if not trade_symbols or trade_body is None or quote_range_body is None:
+        return [], set()
+
+    trades = trade_body.get("trades") if isinstance(trade_body.get("trades"), dict) else {}
+    quote_index = _quote_rows_by_symbol(quote_range_body)
+    messages: list[dict[str, Any]] = []
+    emitted_symbols: set[str] = set()
+    last_quote_signature: dict[str, tuple[float, float, int]] = {}
+
+    for sym in trade_symbols:
+        rows = trades.get(sym) if isinstance(trades, dict) else None
+        if not isinstance(rows, list) or not rows:
+            continue
+        qrows = quote_index.get(sym.upper(), [])
+        if not qrows:
+            log.debug("Replay skip trades for %s: no quotes in range", sym)
+            continue
+
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            trade_dt = _row_dt(row)
+            if trade_dt is None:
+                continue
+            quote_row = _quote_row_at_or_before(qrows, trade_dt, max_quote_lag_seconds)
+            if quote_row is None:
+                continue
+
+            quote_msg = _stream_quote_msg(sym, quote_row)
+            if quote_msg is None:
+                continue
+            trade_msg = _stream_trade_msg(sym, row, idx)
+            if trade_msg is None:
+                continue
+
+            q_sig = (float(quote_msg["bp"]), float(quote_msg["ap"]), _stream_message_sort_key(quote_msg)[0])
+            if last_quote_signature.get(sym.upper()) != q_sig:
+                messages.append(quote_msg)
+                last_quote_signature[sym.upper()] = q_sig
+                _remember_stream_quote(st, sym, quote_row)
+
+            messages.append(trade_msg)
+            emitted_symbols.add(sym.upper())
+            try:
+                st.remember_market_price(sym, float(trade_msg["p"]), row.get("t"))
+            except (TypeError, ValueError):
+                pass
+
+    return messages, emitted_symbols
 
 
 def _ws_accept_value(key: str) -> str:
@@ -2135,11 +2271,13 @@ class DataHandler(BaseHTTPRequestHandler):
         use_upstream = bool(st.alpaca_historical_et_date and st.upstream_api_key and st.upstream_secret_key)
 
         quote_body: dict[str, Any] | None = None
+        quote_range_body: dict[str, Any] | None = None
         trade_body: dict[str, Any] | None = None
         bar_body: dict[str, Any] | None = None
         if use_upstream and (quote_symbols or trade_symbols or bar_symbols):
             bar_start = last_emit_utc - timedelta(minutes=1)
-            with ThreadPoolExecutor(max_workers=3) as pool:
+            quote_range_start = last_emit_utc - timedelta(seconds=_REPLAY_TRADE_QUOTE_LOOKBACK_SECONDS)
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 futures: dict[str, Any] = {}
                 if quote_symbols:
                     futures["quotes"] = pool.submit(
@@ -2153,6 +2291,22 @@ class DataHandler(BaseHTTPRequestHandler):
                         st.replay_cache_dir,
                     )
                 if trade_symbols:
+                    futures["quote_range"] = pool.submit(
+                        proxy_stock_quotes,
+                        {
+                            "symbols": [",".join(trade_symbols)],
+                            "start": [_iso(quote_range_start)],
+                            "end": [_iso(now)],
+                            "limit": ["10000"],
+                            "sort": ["asc"],
+                        },
+                        st.replay_target_et_date(),
+                        st.upstream_data_url,
+                        st.upstream_api_key,
+                        st.upstream_secret_key,
+                        now,
+                        st.replay_cache_dir,
+                    )
                     futures["trades"] = pool.submit(
                         proxy_stock_trades,
                         {
@@ -2189,29 +2343,55 @@ class DataHandler(BaseHTTPRequestHandler):
                 for key, future in futures.items():
                     code, body = future.result()
                     if code != 200 or not isinstance(body, dict):
+                        if key == "quote_range":
+                            log.warning("Replay quote range unavailable; trade ticks skipped this tick")
                         continue
                     if key == "quotes":
                         quote_body = body
+                    elif key == "quote_range":
+                        quote_range_body = body
                     elif key == "trades":
                         trade_body = body
                     else:
                         bar_body = body
 
         messages: list[dict[str, Any]] = []
-        messages.extend(
-            self._ws_quote_messages(st, quote_symbols, now, upstream=use_upstream, quote_body=quote_body)
-        )
-        messages.extend(
-            self._ws_trade_messages(
-                st, trade_symbols, last_emit_utc, now, upstream=use_upstream, trade_body=trade_body
+        paired_symbols: set[str] = set()
+        if use_upstream and trade_symbols:
+            if trade_body is not None and quote_range_body is not None:
+                paired, paired_symbols = _ws_replay_paired_trade_quote_messages(
+                    st,
+                    trade_symbols,
+                    trade_body,
+                    quote_range_body,
+                )
+                messages.extend(paired)
+            elif trade_body is not None:
+                log.warning("Replay trades skipped: quote range fetch failed")
+        elif trade_symbols:
+            messages.extend(
+                self._ws_trade_messages(
+                    st, trade_symbols, last_emit_utc, now, upstream=use_upstream, trade_body=trade_body
+                )
             )
-        )
+
+        quote_stream_symbols = [sym for sym in quote_symbols if sym not in paired_symbols]
+        if quote_stream_symbols:
+            messages.extend(
+                self._ws_quote_messages(
+                    st, quote_stream_symbols, now, upstream=use_upstream, quote_body=quote_body
+                )
+            )
+        elif quote_body is not None and use_upstream and quote_symbols:
+            _backfill_replay_latest_quotes(st, {"symbols": [",".join(quote_symbols)]}, quote_body)
+            st.remember_market_data(quote_body)
+
         messages.extend(
             self._ws_bar_messages(
                 st, bar_symbols, last_emit_utc, now, last_bar_t, upstream=use_upstream, bar_body=bar_body
             )
         )
-        messages.sort(key=lambda item: str(item.get("t", "")))
+        messages.sort(key=_stream_message_sort_key)
         return messages, now
 
     def _ws_emit_stream_tick(
