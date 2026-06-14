@@ -75,6 +75,20 @@ class HistoricalProxyTests(unittest.TestCase):
         self.assertEqual(params["start"], "2026-05-13T08:00:00.000Z")
         self.assertEqual(params["end"], "2026-05-14T13:35:16.000Z")
 
+    def test_morning_session_preload_uses_session_backfill(self):
+        replay_now = datetime(2026, 6, 1, 13, 35, 0, tzinfo=timezone.utc)  # 09:35 ET
+        qs = parse_qs(
+            "symbols=BROS&timeframe=1Min"
+            "&start=2026-06-01T08:00:00Z"
+            "&end=2026-06-01T13:35:00Z"
+            "&feed=iex"
+        )
+
+        params = _flatten_upstream_params(qs, date(2026, 6, 1), replay_now)
+
+        self.assertEqual(params["start"], "2026-05-29T08:00:00.000Z")
+        self.assertEqual(params["end"], "2026-06-01T13:35:00.000Z")
+
     def test_short_explicit_bar_poll_tracks_replay_clock(self):
         replay_now = datetime(2026, 5, 14, 13, 35, 16, tzinfo=timezone.utc)
         qs = parse_qs(

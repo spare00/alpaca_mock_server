@@ -231,15 +231,21 @@ def _previous_weekday(d: date) -> date:
 
 
 def _is_session_backfill_window(start_utc: datetime, end_utc: datetime, timeframe: str) -> bool:
+    """Detect stocktrader's broad intraday preload (04:00–session end), not short REST poll windows."""
     if timeframe_to_seconds(timeframe) >= 86400:
         return False
     start_et = start_utc.astimezone(_NY)
     end_et = end_utc.astimezone(_NY)
     if start_et.date() != end_et.date():
         return False
-    if end_utc - start_utc < timedelta(hours=6):
+    span = end_utc - start_utc
+    if span < timedelta(minutes=30):
         return False
-    return start_et.time() <= time_of_day(4, 30) and end_et.time() >= time_of_day(15, 30)
+    if start_et.time() > time_of_day(4, 30):
+        return False
+    if end_et.time() > time_of_day(16, 0):
+        return False
+    return span >= timedelta(hours=4)
 
 
 def _session_backfill_params(
